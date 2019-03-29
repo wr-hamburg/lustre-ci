@@ -553,8 +553,14 @@ struct osc_brw_async_args {
 	int			 aa_requested_nob;
 	int			 aa_nio_count;
 	u32			 aa_page_count;
+	/* number of compressed pages */
+	u32			 aa_c_page_count;
 	int			 aa_resends;
+	/* pointerarray for releasing buffers loaned from cmp_pool */
+	char			**aa_cmp_chunks;
 	struct brw_page		**aa_ppga;
+	/* pointer to array of compressed brw pages */
+	struct brw_page		**aa_cppga;
 	struct client_obd	*aa_cli;
 	struct list_head	 aa_oaps;
 	struct list_head	 aa_exts;

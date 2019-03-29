@@ -45,8 +45,14 @@
 #include <obd_cksum.h>
 #include <obd_class.h>
 #include <lustre_osc.h>
+#include <lcomp.h>
+#include <linux/delay.h>
+#include <linux/byteorder/generic.h>
 
 #include "osc_internal.h"
+
+
+#define	BE_32(x)	cpu_to_be32(x)
 
 atomic_t osc_pool_req_count;
 unsigned int osc_reqpool_maxreqcount;
@@ -80,6 +86,8 @@ struct osc_ladvise_args {
 	void			*la_cookie;
 };
 
+static void osc_release_cppga(struct brw_page **ppga, struct brw_page **cppga,
+			      char **cmp_chunks, size_t count, int niocount);
 static void osc_release_ppga(struct brw_page **ppga, size_t count);
 static int brw_interpret(const struct lu_env *env, struct ptlrpc_request *req,
 			 void *data, int rc);
@@ -1290,6 +1298,432 @@ static int osc_checksum_bulk_rw(const char *obd_name,
 	RETURN(rc);
 }
 
+static inline struct page *mem_to_page(void *addr)
+{
+	if (!is_vmalloc_addr(addr))
+		return virt_to_page(addr);
+
+	return vmalloc_to_page(addr);
+}
+
+/**
+ * Calculate initial chunks
+ *
+ * \param[in] page_count    original page count
+ * \param[out] chunksize    initial chunksize in bytes (ZFS record size)
+ * \param[out] chunks       number of chunks/niobufs
+ * \param[in]  pga          original page array
+ * \param[out] ccdesc       compressed chunk descriptor
+ *
+ * \retval      0 on success
+ * \retval      negative value on error
+ */
+int
+calc_chunks(u32 page_count, int *chunksize, int *chunks, struct brw_page **pga,
+		struct comp_chunk_desc **ccdesc)
+{
+	int i = 0;
+	int c = 0;
+	int p = 0;
+	/* TODO: get correct record size from ZFS
+	 * obd_connect_data->ocd_grant_blkbits
+	 * cli->cl_chunkbits
+	 * In this version with old lz4 block format, block size to be preset
+	 * when module is loaded, pool blocks and chunksize defined then.
+	 * Will change with next lz4 and pool version. Not critical when data
+	 * decompressed by Lustre server when written. Critical when passing
+	 * by to ZFS (compressed) with different record size
+	 */
+	int ppchunk = 32;
+	/* TODO: is there any maximum for number of niobufs? */
+	int MAX_CHUNKS = 120;
+	/* TODO: may be too large for the small stack? -> OBD_ALLOC */
+	int lsizes[MAX_CHUNKS];
+	int loffset = 0;
+
+	memset(lsizes, 0, sizeof(lsizes));
+	*chunksize = ppchunk * PAGE_SIZE;
+
+	if (*chunksize % PAGE_SIZE != 0)
+		goto error;
+
+	/* TODO think about pg->off
+	 * Probably not all data is aligned to page boundaries?
+	 */
+
+	for (p = 0; p < page_count; ) {
+		for (i = 1; i < ppchunk; i++) {
+			/* Announce a new niobuf/chunk if chunksize
+			 * or page_count is reached, OR original page
+			 * pair was not mergable.
+			 * !(A && B) since B must not be evaluated if
+			 * A was wrong.
+			 */
+			if (!(((page_count - p) > i)
+				&& can_merge_pages(pga[p + i - 1], pga[p + i])))
+				break;
+		}
+
+		if (i > 1)
+			lsizes[c] = (i - 1) * PAGE_SIZE;
+		lsizes[c] += pga[p + i - 1]->count;
+
+		p = p + i;
+		c++;
+		if (c > MAX_CHUNKS)
+			goto error;
+	}
+
+	*chunks = c;
+	if (p != page_count ||
+		*chunks < (page_count * PAGE_SIZE / *chunksize) ||
+		*chunks < 0)
+		goto error;
+
+	OBD_ALLOC(*ccdesc, *chunks * sizeof(struct comp_chunk_desc));
+	if (*ccdesc == NULL)
+		goto error;
+	for (c = 0; c < (*chunks); c++) {
+		(*ccdesc)[c].ccd_lsize = lsizes[c];
+		(*ccdesc)[c].ccd_lpages = lsizes[c] / PAGE_SIZE;
+		if (lsizes[c] % PAGE_SIZE > 0)
+			(*ccdesc)[c].ccd_lpages += 1;
+		(*ccdesc)[c].ccd_loffset = loffset;
+		loffset += (*ccdesc)[c].ccd_lpages * PAGE_SIZE;
+	}
+
+	return 0;
+
+error:
+	/* Proposed number of chunks/niobufs exceeds limits
+	 * TODO better return value
+	 * TODO CDEBUG ...
+	 */
+	return -1;
+
+}
+
+/**
+ * Compress data with a compressor that can deal with page arrays
+ *
+ * \param[in]	pga			original page array
+ * \param[out]	cpga		compressed page array
+ * \param[in]	page_count	original page count
+ * \param[out]	cs			number of chunks/niobufs
+ * \param[in]	algo		algorithm to be used for compression
+ * \param[out]	ccdesc		compressed chunk descriptor
+ * \param[out]	cmp_chunks	pointer array contains cmp_pool buffers
+ *
+ * \retval		number of physical pages on successful compression
+ * \retval		negative value on error
+ */
+int compress_pga(struct brw_page **pga, u32 page_count, int *cs,
+		 struct comp_chunk_desc **ccdesc, struct brw_page ***cpga,
+		 enum l_compress algo)
+{
+	/* TODO */
+	return -1;
+}
+
+/**
+ * Compress data with a compressor that can only deal with contiguous buffers
+ *
+ * \param[in]	pga		original page array
+ * \param[out]	cpga		compressed page array
+ * \param[in]	page_count	original page count
+ * \param[out]	cs		number of chunks/niobufs
+ * \param[in]	algo		algorithm to be used for compression
+ * \param[out]	ccdesc		chunk descriptor
+ * \param[out]	cmp_chunks	pointer array contains cmp_pool buffers
+ *
+ * \retval	number of physical pages on successful compression
+ * \retval	negative value on error
+ */
+int compress_cbuf(struct brw_page **pga, struct brw_page ***cpga,
+		  u32 page_count, int *cs, enum l_compress algo,
+		  struct comp_chunk_desc **tmp_ccdesc, char ***cmp_chunks)
+{
+	/* index */
+	int page, cpage;
+	/* chunk index */
+	int c = 0;
+	/* total number of pages for compressed data, physical pages */
+	int ppages = 0;
+	/* total number of pages for compressed data, logical pages */
+	int lpages = 0;
+	/* number of compressed bytes per chunk */
+	uint32_t comprsd = 0;
+	/* number of compressed pages per chunk */
+	int comp_pages = 0;
+	/* number of chunks/records per RPC */
+	int chunks = 0;
+	/* failure return value */
+	int rc = 0;
+	/* initial max size of a chunk in bytes (ZFS record size) */
+	int chunksize = 0;
+	/* total offset within RPC for page_count */
+	size_t buf_offset = 0;
+	/* src: source address of the original data */
+	void *src = NULL;
+	/* address of the working memory of size LZ4_MEM_COMPRESS */
+	void *wrkmem = NULL;
+	/* dst: output buffer address of the compressed data */
+	char **dst = NULL;
+	/* help */
+	struct brw_page *pg = NULL;
+	/* chunk header */
+	/* TODO more general */
+	uint32_t header;
+	/* local help */
+	struct comp_chunk_desc *ccdesc = NULL;
+
+	/* TODO: Remove this assertion if a redo of compression is somewhere
+	 * required
+	 */
+	LASSERT(*cpga == NULL);
+
+	/* Calculate chunks and logical properties */
+	rc = calc_chunks(page_count, &chunksize, cs, pga, tmp_ccdesc);
+	if (rc != 0)
+		return -1;
+
+	chunks = *cs;
+	ccdesc = *tmp_ccdesc;
+
+	if (chunks == 1 && ccdesc[0].ccd_lsize < chunksize) {
+		CDEBUG(D_INFO, "Single small block, req not compressed\n");
+		/* TODO: check it earlier?
+		 * TODO: Own debug level, D_COMP or D_TRANS for compression
+		 * and encryption?
+		 */
+		goto free;
+	}
+	/* src-buffer reused in every per-chunk iteration.
+	 * Needs more buffers for parallel compression
+	 */
+	src = cmp_pool_get_page_buffer(chunksize);
+	OBD_ALLOC(dst, chunks * sizeof(char *));
+	OBD_ALLOC(*cmp_chunks, chunks * sizeof(char *));
+	if (src == NULL || dst == NULL || *cmp_chunks == NULL) {
+		rc = ENOMEM;
+		goto free;
+	}
+
+	/* Atomic get of several buffers. Will fail if the requested number is
+	 * not available at once.
+	 */
+	rc = cmp_pool_get_many_buffers(chunks, chunksize, (void **)dst);
+	if (rc != 0)
+		goto free;
+
+	for (c = 0; c < chunks; c++)
+		(*cmp_chunks)[c] = dst[c];
+
+	OBD_ALLOC(*cpga, page_count * sizeof(struct brw_page *));
+	if (*cpga == NULL) {
+		rc = ENOMEM;
+		goto free;
+	}
+	for (page = 0; page < page_count; page++) {
+		OBD_ALLOC((*cpga)[page], sizeof(struct brw_page));
+
+		if ((*cpga)[page] == NULL) {
+			rc = ENOMEM;
+			goto free;
+		}
+	}
+
+	/* TODO: more generic for different algos */
+	OBD_ALLOC_LARGE(wrkmem, LZ4_MEM_COMPRESS);
+	if (wrkmem == NULL) {
+		rc = ENOMEM;
+		goto free;
+	}
+
+	/* Begin offset with original offset, which is not necessarily 0 */
+	buf_offset = pga[0]->off;
+
+	for (c = 0; c < chunks; c++) {
+		ccdesc[c].ccd_chunksize = chunksize;
+		if (ccdesc[c].ccd_lsize < ccdesc[c].ccd_chunksize) {
+			/* TODO: Own debug level, D_COMP or D_TRANS for
+			 * compression and encryption?
+			 */
+			CDEBUG(D_INFO, "Not full block, not compressed\n");
+			comprsd = 0;
+			page = ccdesc[c].ccd_lpages;
+			goto uncompressed;
+		}
+		for (page = 0; page < ccdesc[c].ccd_lpages; page++) {
+			pg = pga[lpages + page];
+			LASSERT(pg->count > 0);
+
+			/* TODO: Assumed data aligned to page boundaries,
+			 * not always true
+			 */
+			memcpy(src + page * PAGE_SIZE, page_address(pg->pg),
+			       pg->count);
+		}
+
+		/* TODO: more generic for different algos */
+		if (algo == L_COMPRESS_LZ4) {
+			comprsd = LZ4_compress_default(src,
+					(char *)dst[c] + sizeof(header),
+					ccdesc[c].ccd_lsize,
+					ccdesc[c].ccd_lsize - sizeof(header),
+					wrkmem);
+		}
+uncompressed:
+		lpages += page;
+		if (comprsd <= 0) { /* Chunk could not be compressed */
+			/* TODO: Own debug level, D_COMP or D_TRANS for
+			 * compression and encryption?
+			 */
+			CDEBUG(D_INFO, "Could not compress this chunk\n");
+			ccdesc[c].ccd_psize = ccdesc[c].ccd_lsize;
+			ccdesc[c].ccd_ppages = ccdesc[c].ccd_lpages;
+			ccdesc[c].ccd_header = 0;
+			ccdesc[c].ccd_algo = L_COMPRESS_OFF;
+
+			for (cpage = 0; cpage < ccdesc[c].ccd_lpages; cpage++) {
+				pg = (*cpga)[ppages + cpage];
+				/* Global logical(src) index lpages is at the
+				 * end of last seen chunk. Need to go globally
+				 * to the beginning of the last seen chunk
+				 * (- ccdesc[c].ccd_lpages) and iterate over
+				 * each page (+ cpage)
+				 */
+				pg->pg = pga[lpages - ccdesc[c].ccd_lpages
+						+ cpage]->pg;
+				pg->off = buf_offset;
+				pg->count = pga[lpages - ccdesc[c].ccd_lpages
+						+ cpage]->count;
+				pg->flag = pga[lpages - ccdesc[c].ccd_lpages
+						+ cpage]->flag;
+
+				buf_offset += PAGE_SIZE;
+			}
+
+			ccdesc[c].ccd_poffset = ppages * PAGE_SIZE;
+			ppages += ccdesc[c].ccd_lpages;
+
+			/* If compression failed for a certain chunk, we use
+			 * the original pages and the dst[c] buffer is not
+			 * needed anymore. It can be given back to the pool
+			 * immediately. Remember already released buffers with
+			 * NULL
+			 */
+			LASSERT(dst[c] == (*cmp_chunks)[c]);
+			cmp_pool_return_page_buffer((*cmp_chunks)[c]);
+			(*cmp_chunks)[c] = NULL;
+		} else { /* Chunk was successfully compressed */
+			/* ZFS compatible */
+			header = BE_32(comprsd);
+
+			memcpy(dst[c], &header, sizeof(header));
+
+			comp_pages = (comprsd + sizeof(header)) / PAGE_SIZE;
+			if ((comprsd + sizeof(header)) % PAGE_SIZE > 0)
+				comp_pages += 1;
+
+			for (cpage = 0; cpage < comp_pages; cpage++) {
+
+				pg = (*cpga)[ppages + cpage];
+				/* change view from void* to page* with
+				 * mem_to_page
+				 */
+				pg->pg = mem_to_page(dst[c] + cpage
+							* PAGE_SIZE);
+				pg->count = PAGE_SIZE;
+				if (unlikely(cpage == comp_pages - 1
+						&& ((comprsd
+							+ sizeof(header))
+						% PAGE_SIZE) > 0))
+					pg->count = (comprsd
+						+ sizeof(header)) % PAGE_SIZE;
+
+				pg->off = buf_offset;
+				/* TODO: are all page flags the same within
+				 * 1 chunk?
+				 */
+				pg->flag = pga[ccdesc[c].ccd_lpages-1]->flag;
+				buf_offset += PAGE_SIZE;
+			}
+
+			ccdesc[c].ccd_compressed = 1;
+			ccdesc[c].ccd_algo = algo;
+			ccdesc[c].ccd_header = sizeof(header);
+			ccdesc[c].ccd_psize = comprsd;
+			ccdesc[c].ccd_ppages = comp_pages;
+			ccdesc[c].ccd_poffset = ppages * PAGE_SIZE;
+			ccdesc[c].ccd_decomp = L_CSERVER;
+
+			ppages += comp_pages;
+
+			/* Remember cmp_buffer that is in use */
+			LASSERT((*cmp_chunks)[c] == dst[c]);
+		}
+	}
+
+free:
+	if (wrkmem != NULL)
+		OBD_FREE_LARGE(wrkmem, LZ4_MEM_COMPRESS);
+	if (dst != NULL)
+		OBD_FREE(dst, chunks * sizeof(void *));
+	if (src != NULL)
+		cmp_pool_return_page_buffer(src);
+	if (rc != 0) {
+		if (*cpga != NULL) {
+			osc_release_cppga(pga, *cpga, *cmp_chunks,
+						page_count, chunks);
+			*cpga = NULL;
+		}
+		/* TODO CDEBUG ... */
+		RETURN(-ENOMEM);
+	}
+
+	return ppages;
+}
+
+/**
+ * Compress data from pga to cpga
+ *
+ * \param[in]	pga		original page array
+ * \param[out]	cpga		compressed page array
+ * \param[in]	page_count	original page count
+ * \param[out]	cs		number of chunks/niobufs
+ * \param[out]	ccdesc		chunk descriptor
+ * \param[out]	cmp_chunks	pointer array contains cmp_pool buffers
+ *
+ * \retval		0 on successful prepare
+ * \retval		negative value on error
+ */
+int compress_data(struct brw_page **pga, struct brw_page ***cpga,
+					u32 page_count, int *cs,
+					struct comp_chunk_desc **ccdesc,
+					char ***cmp_chunks)
+{
+	enum l_compress algo = L_COMPRESS_LZ4;
+
+	/* TODO: Decide first which compressor here to use
+	 * int comp_level;
+	 * set_lcomp_algo(..., &algo, &comp_level);
+	 */
+
+	/* TODO: Add a restriction for one compression type per file or
+	 * compress chunks completely independent
+	 */
+	if (CAN_PGA(algo))
+		return compress_pga(pga, page_count, cs, ccdesc, cpga, algo);
+
+	if (CAN_CBUF(algo))
+		return compress_cbuf(pga, cpga, page_count, cs, algo, ccdesc,
+				     cmp_chunks);
+
+	/* TODO CDEBUG ... */
+	return -1;
+}
+
 static int
 osc_brw_prep_request(int cmd, struct client_obd *cli, struct obdo *oa,
 		     u32 page_count, struct brw_page **pga,
@@ -1306,8 +1740,34 @@ osc_brw_prep_request(int cmd, struct client_obd *cli, struct obdo *oa,
         struct brw_page *pg_prev;
 	void *short_io_buf;
 	const char *obd_name = cli->cl_import->imp_obd->obd_name;
+	const struct ptlrpc_bulk_frag_ops *bops = &ptlrpc_bulk_kiov_pin_ops;
+
+	/* probably not required when read path is compressed */
+	u32 pcount = page_count;
+	/* chunk descriptor to be sent */
+	struct comp_chunk_desc *ccdesc = NULL;
+	/* tmp ccdesc since pill ready after compression */
+	struct comp_chunk_desc *tmp_ccdesc = NULL;
+	/* outgoing compressed brw page array */
+	struct brw_page **cpga = NULL;
+	/* pointer array for buffers loaned from cmp_pool */
+	char **cmp_chunks = NULL;
+	/* number of total chunks = niocount */
+	int chunks = 1;
+	/* chunk index */
+	int c = 0;
+	/* request compressed or not */
+	/* if cli->cl_compression is per request, use it instead */
+	int compressed = cli->cl_compression;
 
         ENTRY;
+	/* TODO will be set dynamically in future;
+	 * settable with lctl osc.*.compression
+	 Just for testing purpose here
+	 */
+	cli->cl_compression = 1;
+	compressed = cli->cl_compression;
+
         if (OBD_FAIL_CHECK(OBD_FAIL_OSC_BRW_PREP_REQ))
                 RETURN(-ENOMEM); /* Recoverable */
         if (OBD_FAIL_CHECK(OBD_FAIL_OSC_BRW_PREP_REQ2))
@@ -1317,7 +1777,17 @@ osc_brw_prep_request(int cmd, struct client_obd *cli, struct obdo *oa,
 		opc = OST_WRITE;
 		req = ptlrpc_request_alloc_pool(cli->cl_import,
 						osc_rq_pool,
-						&RQF_OST_BRW_WRITE);
+						&RQF_OST_COMP_BRW_WRITE);
+		if (cli->cl_compression == 1) {
+			pcount = compress_data(pga, &cpga, page_count, &chunks,
+						&tmp_ccdesc, &cmp_chunks);
+			if (pcount < 1) {
+				tmp_ccdesc = NULL;
+				chunks = 0;
+				pcount = page_count;
+				compressed = 0;
+			}
+		}
 	} else {
 		opc = OST_READ;
 		req = ptlrpc_request_alloc(cli->cl_import, &RQF_OST_BRW_READ);
@@ -1325,10 +1795,14 @@ osc_brw_prep_request(int cmd, struct client_obd *cli, struct obdo *oa,
         if (req == NULL)
                 RETURN(-ENOMEM);
 
-        for (niocount = i = 1; i < page_count; i++) {
-                if (!can_merge_pages(pga[i - 1], pga[i]))
-                        niocount++;
-        }
+	if (opc == OST_WRITE && compressed) {
+		niocount = chunks;
+	} else {
+		for (niocount = i = 1; i < page_count; i++) {
+			if (!can_merge_pages(pga[i - 1], pga[i]))
+				niocount++;
+		}
+	}
 
         pill = &req->rq_pill;
         req_capsule_set_size(pill, &RMF_OBD_IOOBJ, RCL_CLIENT,
@@ -1336,19 +1810,32 @@ osc_brw_prep_request(int cmd, struct client_obd *cli, struct obdo *oa,
         req_capsule_set_size(pill, &RMF_NIOBUF_REMOTE, RCL_CLIENT,
                              niocount * sizeof(*niobuf));
 
-	for (i = 0; i < page_count; i++)
-		short_io_size += pga[i]->count;
+	/* TODO: compression + short I/O useful? */
+	if (opc == OST_READ || !compressed) {
 
-	/* Check if read/write is small enough to be a short io. */
-	if (short_io_size > cli->cl_max_short_io_bytes || niocount > 1 ||
-	    !imp_connect_shortio(cli->cl_import))
-		short_io_size = 0;
+		for (i = 0; i < page_count; i++)
+			short_io_size += pga[i]->count;
 
-	req_capsule_set_size(pill, &RMF_SHORT_IO, RCL_CLIENT,
-			     opc == OST_READ ? 0 : short_io_size);
-	if (opc == OST_READ)
+		/* Check if read/write is small enough to be a short io. */
+		if (short_io_size > cli->cl_max_short_io_bytes || niocount > 1 
+			|| !imp_connect_shortio(cli->cl_import))
+			short_io_size = 0;
+
+		req_capsule_set_size(pill, &RMF_SHORT_IO, RCL_CLIENT,
+				     opc == OST_READ ? 0 : short_io_size);
+	}
+	if (opc == OST_READ) {
 		req_capsule_set_size(pill, &RMF_SHORT_IO, RCL_SERVER,
 				     short_io_size);
+		/* TODO need that? */
+		req_capsule_set_size(pill, &RMF_COMP_CHUNK_DESC, RCL_CLIENT, 0);
+	}
+
+	/* Important set size to 0 for writes with empty comp desc*/
+	if (opc == OST_WRITE) {
+		req_capsule_set_size(pill, &RMF_COMP_CHUNK_DESC, RCL_CLIENT,
+					  chunks * sizeof(*ccdesc));
+	}
 
         rc = ptlrpc_request_pack(req, LUSTRE_OST_VERSION, opc);
         if (rc) {
@@ -1368,13 +1855,17 @@ osc_brw_prep_request(int cmd, struct client_obd *cli, struct obdo *oa,
 		goto no_bulk;
 	}
 
-	desc = ptlrpc_prep_bulk_imp(req, page_count,
+	if (opc == OST_WRITE && compressed)
+		bops = &ptlrpc_bulk_kiov_nopin_ops;
+
+	desc = ptlrpc_prep_bulk_imp(req, pcount,
 		cli->cl_import->imp_connect_data.ocd_brw_size >> LNET_MTU_BITS,
-		(opc == OST_WRITE ? PTLRPC_BULK_GET_SOURCE :
+		(opc == OST_WRITE ?
+			PTLRPC_BULK_GET_SOURCE :
 			PTLRPC_BULK_PUT_SINK) |
 			PTLRPC_BULK_BUF_KIOV,
-		OST_BULK_PORTAL,
-		&ptlrpc_bulk_kiov_pin_ops);
+			OST_BULK_PORTAL,
+			bops);
 
         if (desc == NULL)
                 GOTO(out, rc = -ENOMEM);
@@ -1384,6 +1875,12 @@ no_bulk:
         ioobj = req_capsule_client_get(pill, &RMF_OBD_IOOBJ);
         niobuf = req_capsule_client_get(pill, &RMF_NIOBUF_REMOTE);
         LASSERT(body != NULL && ioobj != NULL && niobuf != NULL);
+
+	if (opc == OST_WRITE && compressed) {
+		ccdesc = req_capsule_client_get(pill, &RMF_COMP_CHUNK_DESC);
+		LASSERT(ccdesc != NULL);
+	}
+	/* XXX: ccdesc is NULL during read until read path is implemented */
 
 	lustre_set_wire_obdo(&req->rq_import->imp_connect_data, &body->oa, oa);
 
@@ -1423,30 +1920,59 @@ no_bulk:
 		}
 	}
 
-	LASSERT(page_count > 0);
-	pg_prev = pga[0];
-        for (requested_nob = i = 0; i < page_count; i++, niobuf++) {
-                struct brw_page *pg = pga[i];
-		int poff = pg->off & ~PAGE_MASK;
+	LASSERT(pcount > 0);
+	if (opc == OST_WRITE && compressed) {
+		/* Copy chunk descriptors */
+		for (c = 0; c < chunks; c++)
+			memcpy(&ccdesc[c], &tmp_ccdesc[c],
+				sizeof(struct comp_chunk_desc));
+		pg_prev = cpga[0];
+	} else
+		pg_prev = pga[0];
 
-                LASSERT(pg->count > 0);
-                /* make sure there is no gap in the middle of page array */
-		LASSERTF(page_count == 1 ||
-			 (ergo(i == 0, poff + pg->count == PAGE_SIZE) &&
-			  ergo(i > 0 && i < page_count - 1,
-			       poff == 0 && pg->count == PAGE_SIZE)   &&
-			  ergo(i == page_count - 1, poff == 0)),
-			 "i: %d/%d pg: %p off: %llu, count: %u\n",
-			 i, page_count, pg, pg->off, pg->count);
-                LASSERTF(i == 0 || pg->off > pg_prev->off,
-			 "i %d p_c %u pg %p [pri %lu ind %lu] off %llu"
-			 " prev_pg %p [pri %lu ind %lu] off %llu\n",
-                         i, page_count,
-                         pg->pg, page_private(pg->pg), pg->pg->index, pg->off,
-                         pg_prev->pg, page_private(pg_prev->pg),
-                         pg_prev->pg->index, pg_prev->off);
+	for (requested_nob = i = 0; i < pcount; i++) {
+		struct brw_page *pg;
+		int poff;
+
+		if (opc == OST_WRITE && compressed)
+			pg = cpga[i];
+		else
+			pg = pga[i];
+
+		poff = pg->off & ~PAGE_MASK;
+		LASSERT(pg->count > 0);
+
+		if (!compressed) {
+			/* ergo(i > 0 && i < c_page_count - 1, poff == 0
+			 * && pg->count == PAGE_SIZE) &&
+			 * This implication is not necessarily true for
+			 * compression; should this be a hard requirement
+			 * for OUTgoing pages?
+			 */
+
+			/* make sure there is no gap in the middle of 
+			 * page array
+			 */
+			LASSERTF(page_count == 1 ||
+				(ergo(i == 0, poff + pg->count == PAGE_SIZE) &&
+				ergo(i > 0 && i < page_count - 1,
+				poff == 0 && pg->count == PAGE_SIZE) &&
+				ergo(i == page_count - 1, poff == 0)),
+				"i: %d/%d pg: %p off: %llu, count: %u\n",
+				i, page_count, pg, pg->off, pg->count);
+		}
+		LASSERTF(i == 0 || pg->off > pg_prev->off,
+			"i %d p_c %u pg %p [pri %lu ind %lu] off %llu"
+			" prev_pg %p [pri %lu ind %lu] off %llu\n",
+			i, pcount,
+			pg->pg, page_private(pg->pg), pg->pg->index,
+			pg->off, pg_prev->pg,
+			page_private(pg_prev->pg),
+			pg_prev->pg->index, pg_prev->off);
+
                 LASSERT((pga[0]->flag & OBD_BRW_SRVLOCK) ==
                         (pg->flag & OBD_BRW_SRVLOCK));
+
 		if (short_io_size != 0 && opc == OST_WRITE) {
 			unsigned char *ptr = ll_kmap_atomic(pg->pg, KM_USER0);
 
@@ -1459,23 +1985,45 @@ no_bulk:
 			desc->bd_frag_ops->add_kiov_frag(desc, pg->pg, poff,
 							 pg->count);
 		}
-		requested_nob += pg->count;
 
-                if (i > 0 && can_merge_pages(pg_prev, pg)) {
-                        niobuf--;
-			niobuf->rnb_len += pg->count;
-		} else {
-			niobuf->rnb_offset = pg->off;
-			niobuf->rnb_len    = pg->count;
-			niobuf->rnb_flags  = pg->flag;
-                }
-                pg_prev = pg;
-        }
+		if ((opc == OST_READ && compressed) || !compressed) {
+			requested_nob += pg->count;
 
-        LASSERTF((void *)(niobuf - niocount) ==
-                req_capsule_client_get(&req->rq_pill, &RMF_NIOBUF_REMOTE),
-                "want %p - real %p\n", req_capsule_client_get(&req->rq_pill,
-                &RMF_NIOBUF_REMOTE), (void *)(niobuf - niocount));
+			if (i > 0 && can_merge_pages(pg_prev, pg)) {
+				niobuf->rnb_len += pg->count;
+			} else {
+				if (i > 0)
+					niobuf++;
+				niobuf->rnb_offset = pg->off;
+				niobuf->rnb_len    = pg->count;
+				niobuf->rnb_flags  = pg->flag;
+			}
+
+			pg_prev = pg;
+		}
+	}
+
+	if (opc == OST_WRITE && compressed) {
+		for (requested_nob = c = 0; c < chunks; c++) {
+			int off_idx = ccdesc[c].ccd_loffset / PAGE_SIZE;
+			struct brw_page *pg = pga[off_idx];
+			int off = pg->off;
+
+			niobuf[c].rnb_offset = off;
+			niobuf[c].rnb_len = ccdesc[c].ccd_psize
+						+ ccdesc[c].ccd_header;
+			niobuf[c].rnb_flags = cpga[(ccdesc[c].ccd_poffset
+						/ PAGE_SIZE)]->flag;
+			requested_nob += niobuf[c].rnb_len;
+		}
+	}
+
+	niobuf = req_capsule_client_get(pill, &RMF_NIOBUF_REMOTE);
+	LASSERTF(niobuf ==
+		req_capsule_client_get(&req->rq_pill,
+			&RMF_NIOBUF_REMOTE), "want %p - real %p\n",
+			req_capsule_client_get(&req->rq_pill,
+			&RMF_NIOBUF_REMOTE), niobuf);
 
         osc_announce_cached(cli, &body->oa, opc == OST_WRITE ? requested_nob:0);
         if (resend) {
@@ -1504,10 +2052,16 @@ no_bulk:
 								cksum_type);
                         body->oa.o_valid |= OBD_MD_FLCKSUM | OBD_MD_FLFLAGS;
 
-			rc = osc_checksum_bulk_rw(obd_name, cksum_type,
-						  requested_nob, page_count,
-						  pga, OST_WRITE,
-						  &body->oa.o_cksum);
+			if (compressed)
+				rc = osc_checksum_bulk_rw(obd_name, cksum_type,
+							  requested_nob, pcount,
+							  cpga, OST_WRITE,
+							  &body->oa.o_cksum);
+			else
+				rc = osc_checksum_bulk_rw(obd_name, cksum_type,
+							  requested_nob, pcount,
+							  pga, OST_WRITE,
+							  &body->oa.o_cksum);
 			if (rc < 0) {
 				CDEBUG(D_PAGE, "failed to checksum, rc = %d\n",
 				       rc);
@@ -1554,10 +2108,17 @@ no_bulk:
 	aa->aa_resends = 0;
 	aa->aa_ppga = pga;
 	aa->aa_cli = cli;
+	if (opc == OST_WRITE && compressed) {
+		aa->aa_cppga = cpga; /* compressed brw page array pointer */
+		aa->aa_cmp_chunks = cmp_chunks;
+		aa->aa_c_page_count = pcount;
+
+		if (tmp_ccdesc != NULL)
+			OBD_FREE(tmp_ccdesc, chunks * sizeof(*tmp_ccdesc));
+	}
 	INIT_LIST_HEAD(&aa->aa_oaps);
 
 	*reqp = req;
-	niobuf = req_capsule_client_get(pill, &RMF_NIOBUF_REMOTE);
 	CDEBUG(D_RPCTRACE, "brw rpc %p - object "DOSTID" offset %lld<>%lld\n",
 		req, POSTID(&oa->o_oi), niobuf[0].rnb_offset,
 		niobuf[niocount - 1].rnb_offset + niobuf[niocount - 1].rnb_len);
@@ -1642,6 +2203,13 @@ check_write_checksum(struct obdo *oa, const struct lnet_process_id *peer,
 	__u32 new_cksum;
 	char *msg;
 	int rc;
+	int page_count;
+
+	/* request was compressed */
+	if (aa->aa_cppga)
+		page_count = aa->aa_c_page_count;
+	else
+		page_count = aa->aa_page_count;
 
         if (server_cksum == client_cksum) {
                 CDEBUG(D_PAGE, "checksum %x confirmed\n", client_cksum);
@@ -1649,7 +2217,7 @@ check_write_checksum(struct obdo *oa, const struct lnet_process_id *peer,
         }
 
 	if (aa->aa_cli->cl_checksum_dump)
-		dump_all_bulk_pages(oa, aa->aa_page_count, aa->aa_ppga,
+		dump_all_bulk_pages(oa, page_count, aa->aa_ppga,
 				    server_cksum, client_cksum);
 
 	cksum_type = obd_cksum_type_unpack(oa->o_valid & OBD_MD_FLFLAGS ?
@@ -1678,11 +2246,11 @@ check_write_checksum(struct obdo *oa, const struct lnet_process_id *peer,
 
 	if (fn)
 		rc = osc_checksum_bulk_t10pi(obd_name, aa->aa_requested_nob,
-					     aa->aa_page_count, aa->aa_ppga,
+					     page_count, aa->aa_ppga,
 					     OST_WRITE, fn, sector_size,
 					     &new_cksum);
 	else
-		rc = osc_checksum_bulk(aa->aa_requested_nob, aa->aa_page_count,
+		rc = osc_checksum_bulk(aa->aa_requested_nob, page_count,
 				       aa->aa_ppga, OST_WRITE, cksum_type,
 				       &new_cksum);
 
@@ -1709,8 +2277,8 @@ check_write_checksum(struct obdo *oa, const struct lnet_process_id *peer,
 			   oa->o_valid & OBD_MD_FLFID ? oa->o_parent_oid : 0,
 			   oa->o_valid & OBD_MD_FLFID ? oa->o_parent_ver : 0,
 			   POSTID(&oa->o_oi), aa->aa_ppga[0]->off,
-			   aa->aa_ppga[aa->aa_page_count - 1]->off +
-				aa->aa_ppga[aa->aa_page_count-1]->count - 1,
+			   aa->aa_ppga[page_count - 1]->off +
+				aa->aa_ppga[page_count-1]->count - 1,
 			   client_cksum,
 			   obd_cksum_type_unpack(aa->aa_oa->o_flags),
 			   server_cksum, cksum_type, new_cksum);
@@ -1780,6 +2348,9 @@ static int osc_brw_fini_request(struct ptlrpc_request *req, int rc)
 					 body->oa.o_cksum, aa))
 			RETURN(-EAGAIN);
 
+		/* page_count not used within thus function, otherwise
+		 * take care of compressed pge_count
+		 */
 		rc = check_write_rcs(req, aa->aa_requested_nob,
 				     aa->aa_nio_count, aa->aa_page_count,
 				     aa->aa_ppga);
@@ -2031,6 +2602,42 @@ static void osc_release_ppga(struct brw_page **ppga, size_t count)
         OBD_FREE(ppga, sizeof(*ppga) * count);
 }
 
+static void osc_release_cppga(struct brw_page **ppga, struct brw_page **cppga,
+			      char **cmp_chunks, size_t page_count,
+			      int niocount)
+{
+	int i = 0;
+
+	LASSERT(ppga != NULL && cppga != NULL);
+
+	for (i = 0; i < niocount; i++) {
+		if (cmp_chunks[i] != NULL)
+			cmp_pool_return_page_buffer(cmp_chunks[i]);
+	}
+	if (cmp_chunks != NULL)
+		OBD_FREE(cmp_chunks, sizeof(*cmp_chunks) * niocount);
+
+	for (i = 0; i < page_count; i++) {
+		if (cppga[i] != NULL)
+			OBD_FREE(cppga[i], sizeof(struct brw_page));
+
+		/* TODO: In common uncompressed case, bulk desc is composed
+		 * with _pin_ops option. Pages are released via put_page in
+		 * ptlrpc_release_bulk_page_pin. In compressed case, bulk desc
+		 * is composed with compressed pages and _nopin_ops. Original
+		 * pages are also not released on that path. Release here
+		 * causes bad page state because pages are tried to be released
+		 * a second time in vvp_page_fini_common. Which path should be
+		 * taken? How to prevent the pages to be released a second time?
+		 *
+		 * unlock_page(ppga[i]->pg);
+		 * put_page(ppga[i]->pg);
+		 */
+	}
+
+	OBD_FREE(cppga, sizeof(*cppga) * page_count);
+}
+
 static int brw_interpret(const struct lu_env *env,
 			 struct ptlrpc_request *req, void *args, int rc)
 {
@@ -2057,6 +2664,12 @@ static int brw_interpret(const struct lu_env *env,
 			       POSTID(&aa->aa_oa->o_oi), rc);
 		} else if (rc == -EINPROGRESS ||
 		    client_should_resend(aa->aa_resends, aa->aa_cli)) {
+
+			/* TODO: redo for compressed case. The recoverable error
+			 * is not caused by compression, so we should be able to
+			 * reuse compressed buffers, otherwise currently
+			 * memory leak
+			 */
 			rc = osc_brw_redo_request(req, aa, rc);
 		} else {
 			CERROR("%s: too many resent retries for object: "
@@ -2139,6 +2752,14 @@ static int brw_interpret(const struct lu_env *env,
 	transferred = (req->rq_bulk == NULL ? /* short io */
 		       aa->aa_requested_nob :
 		       req->rq_bulk->bd_nob_transferred);
+
+	/* Has to be released BEFORE ppga, if we want to release original pages
+	 * here and not in vvp
+	 */
+	if (aa->aa_cppga) {
+		osc_release_cppga(aa->aa_ppga, aa->aa_cppga, aa->aa_cmp_chunks,
+				aa->aa_page_count, aa->aa_nio_count);
+	}
 
 	osc_release_ppga(aa->aa_ppga, aa->aa_page_count);
 	ptlrpc_lprocfs_brw(req, transferred);
@@ -2356,8 +2977,19 @@ out:
 
 		if (oa)
 			OBD_SLAB_FREE_PTR(oa, osc_obdo_kmem);
+
+		/* has to be released BEFORE pga */
+		if (aa && aa->aa_cppga) {
+			if (aa->aa_cmp_chunks == NULL)
+				osc_release_cppga(aa->aa_ppga, aa->aa_cppga,
+							aa->aa_cmp_chunks,
+							aa->aa_page_count,
+							aa->aa_nio_count);
+		}
+
 		if (pga)
-			OBD_FREE(pga, sizeof(*pga) * page_count);
+			osc_release_ppga(pga, page_count);
+
 		/* this should happen rarely and is pretty bad, it makes the
 		 * pending list not follow the dirty order */
 		while (!list_empty(ext_list)) {
@@ -3404,6 +4036,13 @@ static int __init osc_init(void)
 	 * symbols from modules.*/
 	CDEBUG(D_INFO, "Lustre OSC module (%p).\n", &osc_caches);
 
+	/* Handle compression=off case */
+	/* cmp_pool_init (number_of_buffers, size_of_buffer (in bytes))
+	 * TODO: number_of_buffers = MAX(32, number_of_cpus) * default_RPC_size
+	 * Will change with next pool and lz4 version
+	 */
+	cmp_pool_init(100, 128 * 1024);
+
 	rc = lu_kmem_init(osc_caches);
 	if (rc)
 		RETURN(rc);
@@ -3463,6 +4102,7 @@ static void __exit osc_exit(void)
 	class_unregister_type(LUSTRE_OSC_NAME);
 	lu_kmem_fini(osc_caches);
 	ptlrpc_free_rq_pool(osc_rq_pool);
+	cmp_pool_free(); /* release pages at the end */
 }
 
 MODULE_AUTHOR("OpenSFS, Inc. <http://www.lustre.org/>");

@@ -566,8 +566,8 @@ union ptlrpc_async_args {
          * a pointer to it here.  The pointer_arg ensures this struct is at
          * least big enough for that.
          */
-        void      *pointer_arg[11];
-	__u64      space[7];
+	void	*pointer_arg[13];
+	__u64	space[11];
 };
 
 struct ptlrpc_request_set;

@@ -1431,7 +1431,7 @@ struct comp_chunk_desc {
 	/* used algorithm */
 	__u32 ccd_algo;
 	/* size of header (bytes) - for comfort */
-	__u32 ccd_header;
+	uint32_t ccd_header;
 	/* number of uncompressed bytes per chunk */
 	__u32 ccd_lsize;
 	/* number of compressed bytes per chunk */
