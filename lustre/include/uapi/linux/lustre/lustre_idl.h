@@ -1411,6 +1411,37 @@ struct niobuf_remote {
 	__u32	rnb_flags;
 };
 
+/* Chunk descriptor.
+ * TODO: alignment
+ * TODO: check types, 32 or 64 bytes?
+ * This one is sent over the network, should it be smaller at the expense of
+ * comfort?
+ */
+struct comp_chunk_desc {
+	/* chunk offset of uncompressed chunks within RPC - for comfort */
+	__u64 ccd_loffset;
+	/* chunk offset of compressed chunks within RPC  - for comfort */
+	__u64 ccd_poffset;
+	/* whether chunk is compressed or not */
+	__u32 ccd_compressed;
+	/* maximal size of chunk in bytes */
+	__u32 ccd_chunksize;
+	/* where to decompress */
+	__u32 ccd_decomp;
+	/* used algorithm */
+	__u32 ccd_algo;
+	/* size of header (bytes) - for comfort */
+	__u32 ccd_header;
+	/* number of uncompressed bytes per chunk */
+	__u32 ccd_lsize;
+	/* number of compressed bytes per chunk */
+	__u32 ccd_psize;
+	/* number of logical uncompressed pages - for comfort */
+	__u32 ccd_lpages;
+	/* number of physical compressed pages - for comfort */
+	__u32 ccd_ppages;
+};
+
 /* lock value block communicated between the filter and llite */
 
 /* OST_LVB_ERR_INIT is needed because the return code in rc is

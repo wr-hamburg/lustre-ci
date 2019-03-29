@@ -60,6 +60,7 @@ void lustre_swab_hsm_state_set(struct hsm_state_set *hss);
 void lustre_swab_obd_statfs(struct obd_statfs *os);
 void lustre_swab_obd_ioobj(struct obd_ioobj *ioo);
 void lustre_swab_niobuf_remote(struct niobuf_remote *nbr);
+void lustre_swab_comp_chunk_desc(struct comp_chunk_desc *cd);
 void lustre_swab_ost_lvb_v1(struct ost_lvb_v1 *lvb);
 void lustre_swab_ost_lvb(struct ost_lvb *lvb);
 void lustre_swab_obd_quotactl(struct obd_quotactl *q);
@@ -128,6 +129,7 @@ void lustre_swab_ladvise_hdr(struct ladvise_hdr *ladvise_hdr);
 
 /* Functions for dumping PTLRPC fields */
 void dump_rniobuf(struct niobuf_remote *rnb);
+void dump_cdesc(struct comp_chunk_desc *cd);
 void dump_ioo(struct obd_ioobj *nb);
 void dump_ost_body(struct ost_body *ob);
 void dump_rcs(__u32 *rc);

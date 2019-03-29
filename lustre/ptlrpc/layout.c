@@ -637,6 +637,18 @@ static const struct req_msg_field *ost_brw_client[] = {
 	&RMF_OST_BODY,
 	&RMF_OBD_IOOBJ,
 	&RMF_NIOBUF_REMOTE,
+	&RMF_COMP_CHUNK_DESC,
+	&RMF_CAPA1,
+	&RMF_SHORT_IO
+};
+
+/* Compression */
+static const struct req_msg_field *ost_comp_brw_client[] = {
+	&RMF_PTLRPC_BODY,
+	&RMF_OST_BODY,
+	&RMF_OBD_IOOBJ,
+	&RMF_NIOBUF_REMOTE,
+	&RMF_COMP_CHUNK_DESC,
 	&RMF_CAPA1,
 	&RMF_SHORT_IO
 };
@@ -811,7 +823,9 @@ static struct req_format *req_formats[] = {
 	&RQF_OST_SYNC,
 	&RQF_OST_DESTROY,
 	&RQF_OST_BRW_READ,
+	&RQF_OST_COMP_BRW_READ,
 	&RQF_OST_BRW_WRITE,
+	&RQF_OST_COMP_BRW_WRITE,
 	&RQF_OST_STATFS,
 	&RQF_OST_SET_GRANT_INFO,
 	&RQF_OST_GET_INFO,
@@ -1171,6 +1185,12 @@ struct req_msg_field RMF_NIOBUF_INLINE =
 		    sizeof(struct niobuf_remote), lustre_swab_niobuf_remote,
 		    dump_rniobuf);
 EXPORT_SYMBOL(RMF_NIOBUF_INLINE);
+
+struct req_msg_field RMF_COMP_CHUNK_DESC =
+	DEFINE_MSGF("comp_chunk_desc", RMF_F_STRUCT_ARRAY,
+		    sizeof(struct comp_chunk_desc), lustre_swab_comp_chunk_desc,
+		    dump_cdesc);
+EXPORT_SYMBOL(RMF_COMP_CHUNK_DESC);
 
 struct req_msg_field RMF_RCS =
 	DEFINE_MSGF("niobuf_rcs", RMF_F_STRUCT_ARRAY, sizeof(__u32),
@@ -1708,9 +1728,19 @@ struct req_format RQF_OST_BRW_READ =
         DEFINE_REQ_FMT0("OST_BRW_READ", ost_brw_client, ost_brw_read_server);
 EXPORT_SYMBOL(RQF_OST_BRW_READ);
 
+struct req_format RQF_OST_COMP_BRW_READ =
+	DEFINE_REQ_FMT0("OST_COMP_BRW_READ", ost_comp_brw_client,
+			ost_brw_read_server);
+EXPORT_SYMBOL(RQF_OST_COMP_BRW_READ);
+
 struct req_format RQF_OST_BRW_WRITE =
         DEFINE_REQ_FMT0("OST_BRW_WRITE", ost_brw_client, ost_brw_write_server);
 EXPORT_SYMBOL(RQF_OST_BRW_WRITE);
+
+struct req_format RQF_OST_COMP_BRW_WRITE =
+	DEFINE_REQ_FMT0("OST_COMP_BRW_WRITE", ost_comp_brw_client,
+			ost_brw_write_server);
+EXPORT_SYMBOL(RQF_OST_COMP_BRW_WRITE);
 
 struct req_format RQF_OST_STATFS =
         DEFINE_REQ_FMT0("OST_STATFS", empty, obd_statfs_server);

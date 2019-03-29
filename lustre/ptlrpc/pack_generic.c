@@ -1849,6 +1849,21 @@ void lustre_swab_niobuf_remote(struct niobuf_remote *nbr)
 	__swab32s(&nbr->rnb_flags);
 }
 
+void lustre_swab_comp_chunk_desc(struct comp_chunk_desc *cd)
+{
+	__swab64s(&cd->ccd_loffset);
+	__swab64s(&cd->ccd_poffset);
+	__swab32s(&cd->ccd_compressed);
+	__swab32s(&cd->ccd_chunksize);
+	__swab32s(&cd->ccd_decomp);
+	__swab32s(&cd->ccd_algo);
+	__swab32s(&cd->ccd_header);
+	__swab32s(&cd->ccd_lsize);
+	__swab32s(&cd->ccd_psize);
+	__swab32s(&cd->ccd_lpages);
+	__swab32s(&cd->ccd_ppages);
+}
+
 void lustre_swab_ost_body (struct ost_body *b)
 {
         lustre_swab_obdo (&b->oa);
@@ -2618,6 +2633,12 @@ void dump_rniobuf(struct niobuf_remote *nb)
 {
 	CDEBUG(D_RPCTRACE, "niobuf_remote: offset=%llu, len=%d, flags=%x\n",
 	       nb->rnb_offset, nb->rnb_len, nb->rnb_flags);
+}
+
+void dump_cdesc(struct comp_chunk_desc *cd)
+{
+	CDEBUG(D_RPCTRACE, "comp_chunk_desc: compressed=%d, lsize=%d, psize=%d, algo=%d",
+	       cd->ccd_compressed, cd->ccd_lsize, cd->ccd_psize, cd->ccd_algo);
 }
 
 void dump_obdo(struct obdo *oa)
