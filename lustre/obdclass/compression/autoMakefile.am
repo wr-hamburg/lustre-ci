@@ -32,6 +32,10 @@
 # Lustre is a trademark of Sun Microsystems, Inc.
 #
 
+if MODULES
+modulefs_DATA = compression$(KMODEXT)
+endif
+
 SUBDIRS :=
 
 if LZ4

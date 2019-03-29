@@ -2,6 +2,9 @@
 #define _LCOMPRESSION_H
 #endif
 
+/* Compression page pool */
+#include "../obdclass/compression/cmp_pool.h" /* TODO more generic path */
+
 /* LZ4 */
 #if defined(HAVE_KERNEL_LZ4_COMPRESS) || defined(HAVE_KERNEL_LZ4_COMPRESS_FAST)
 #include <linux/lz4.h>

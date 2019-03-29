@@ -709,6 +709,7 @@ load_modules_local() {
 	fi
 	load_module ../lnet/klnds/$LNETLND
 	load_module obdclass/obdclass
+	load_module obdclass/compression/compression
 	load_module ptlrpc/ptlrpc
 	load_module ptlrpc/gss/ptlrpc_gss
 	load_module fld/fld
