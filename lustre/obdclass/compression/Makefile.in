@@ -1,0 +1,13 @@
+@LZ4_TRUE@subdir-m += lz4
+
+@LZ4_TRUE@cMODULES := compression
+
+@LZ4_TRUE@compression-objs :=
+@LZ4_TRUE@compression-objs += lz4/lz4_compress.o lz4/lz4_decompress.o
+
+@LZ4_TRUE@EXTRA_DIST := $(compression-objs:.o=.c)
+@LZ4_TRUE@EXTRA_DIST += lz4/lz4defs.h lz4/lz4.h
+
+@LZ4_TRUE@cEXTRA_PRE_CFLAGS := -O3
+
+@INCLUDE_RULES@

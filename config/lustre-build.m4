@@ -265,6 +265,25 @@ AC_MSG_RESULT([$enable_manpages])
 ]) # LB_CONFIG_MANPAGES
 
 #
+# Check whether or not we should build the LZ4 module in obdclass/compression
+#
+AC_DEFUN([LB_CONFIG_LZ4], [
+LC_HAVE_KERNEL_LZ4_COMPRESS
+LC_HAVE_KERNEL_LZ4_COMPRESS_FAST
+
+AC_MSG_CHECKING([whether to build integrated LZ4 compression module])
+
+build_lz4_module="no"
+AS_IF([test x$have_kernel_lz4_compress_fast = xno -a x$have_kernel_lz4_compress = xno], [
+	# LZ4 is not available in the kernel, so we want to build our own
+	build_lz4_module="yes"
+])
+AC_MSG_RESULT([$build_lz4_module])
+AM_CONDITIONAL(LZ4, [test x$build_lz4_module = xyes])
+
+]) # LB_CONFIG_LZ4
+
+#
 # LB_CONFIG_HEADERS
 #
 # add -include config.h
@@ -639,6 +658,7 @@ LB_CONFIG_TESTS
 LC_CONFIG_CLIENT
 LB_CONFIG_MPITESTS
 LB_CONFIG_SERVERS
+LB_CONFIG_LZ4
 
 # Tests depends from utils (multiop from liblustreapi)
 AS_IF([test "x$enable_utils" = xno], [enable_tests="no"])

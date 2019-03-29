@@ -1345,6 +1345,25 @@ d_child, [
 ]) # LC_HAVE_DENTRY_D_CHILD
 
 #
+# HAVE_KERNEL_LZ4_COMPRESS
+#
+# 3.11 kernel has lz4_compress
+#
+AC_DEFUN([LC_HAVE_KERNEL_LZ4_COMPRESS], [
+have_kernel_lz4_compress="no"
+LB_CHECK_COMPILE([if Linux kernel has 'lz4_compress'],
+lz4_compress, [
+	#include <linux/lz4.h>
+],[
+	lz4_compress((unsigned char*)NULL, (size_t)NULL, (unsigned char*)NULL, (size_t)NULL, NULL);
+], [
+	have_kernel_lz4_compress="yes"
+	AC_DEFINE(HAVE_KERNEL_LZ4_COMPRESS, 1,
+		[kernel has lz4_compress])
+])
+]) # LC_HAVE_KERNEL_LZ4_COMPRESS
+
+#
 # LC_KIOCB_KI_LEFT
 #
 # 3.12 ki_left removed from struct kiocb
@@ -2532,6 +2551,26 @@ getattr_path, [
 ]) # LC_INODEOPS_ENHANCED_GETATTR
 
 #
+# LC_HAVE_KERNEL_LZ4_COMPRESS_FAST
+#
+# Kernel version 4.11 commit 4e1a33b105ddf201f66dcc44490c6086a25eca0b
+# added LZ4_compress_fast.
+#
+AC_DEFUN([LC_HAVE_KERNEL_LZ4_COMPRESS_FAST], [
+have_kernel_lz4_compress_fast="no"
+LB_CHECK_COMPILE([if Linux kernel has 'LZ4_compress_fast'],
+LZ4_compress_fast, [
+	#include <linux/lz4.h>
+],[
+	LZ4_compress_fast(NULL, NULL, NULL, NULL, NULL, NULL);
+], [
+	have_kernel_lz4_compress_fast="yes"
+	AC_DEFINE(HAVE_KERNEL_LZ4_COMPRESS_FAST, 1,
+		[kernel has lz4_compress_fast])
+])
+]) # LC_HAVE_KERNEL_LZ4_COMPRESS_FAST
+
+#
 # LC_VM_OPERATIONS_REMOVE_VMF_ARG
 #
 # Kernel version 4.11 commit 11bac80004499ea59f361ef2a5516c84b6eab675
@@ -3499,6 +3538,10 @@ lustre/fld/Makefile
 lustre/fld/autoMakefile
 lustre/obdclass/Makefile
 lustre/obdclass/autoMakefile
+lustre/obdclass/compression/Makefile
+lustre/obdclass/compression/autoMakefile
+lustre/obdclass/compression/lz4/Makefile
+lustre/obdclass/compression/lz4/autoMakefile
 lustre/obdecho/Makefile
 lustre/obdecho/autoMakefile
 lustre/ofd/Makefile

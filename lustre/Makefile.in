@@ -4,11 +4,13 @@ obj-m += ptlrpc/
 obj-m += obdecho/
 obj-m += mgc/
 obj-m += tests/kernel/
-
+obj-m += obdclass/compression/
 @SERVER_TRUE@obj-m += ost/ mgs/ mdt/ mdd/ ofd/ quota/ osp/ lod/ lfsck/
 @CLIENT_TRUE@obj-m += lov/ osc/ mdc/ lmv/ llite/ fld/
 @LDISKFS_ENABLED_TRUE@obj-m += osd-ldiskfs/
+#@LDISKFS_ENABLED_FALSE@obj-m += obdclass/compression/
 @ZFS_ENABLED_TRUE@obj-m += osd-zfs/
+
 @OSDADDON@
 
 @INCLUDE_RULES@

@@ -362,6 +362,8 @@ struct client_obd {
 	__u64			 cl_quota_last_xid;
 	/* Links to the global list of registered changelog devices */
 	struct list_head	 cl_chg_dev_linkage;
+	/* controls compression support */
+	unsigned int cl_compression:1; /* 0 = disabled, 1 = enabled */
 };
 #define obd2cli_tgt(obd) ((char *)(obd)->u.cli.cl_target_uuid.uuid)
 

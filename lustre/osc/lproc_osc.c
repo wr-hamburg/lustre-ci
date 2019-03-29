@@ -739,6 +739,36 @@ static ssize_t grant_shrink_store(struct kobject *kobj, struct attribute *attr,
 }
 LUSTRE_RW_ATTR(grant_shrink);
 
+static ssize_t compression_show(struct kobject *kobj,
+			      struct attribute *attr,
+			      char *buf)
+{
+	struct obd_device *obd = container_of(kobj, struct obd_device,
+					      obd_kset.kobj);
+
+	return sprintf(buf, "%d\n", obd->u.cli.cl_compression ? 1 : 0);
+}
+
+static ssize_t compression_store(struct kobject *kobj,
+			       struct attribute *attr,
+			       const char *buffer,
+			       size_t count)
+{
+	struct obd_device *obd = container_of(kobj, struct obd_device,
+					      obd_kset.kobj);
+	bool val;
+	int rc;
+
+	rc = kstrtobool(buffer, &val);
+	if (rc)
+		return rc;
+
+	obd->u.cli.cl_compression = val;
+
+	return count;
+}
+LUSTRE_RW_ATTR(compression);
+
 LPROC_SEQ_FOPS_RO_TYPE(osc, connect_flags);
 LPROC_SEQ_FOPS_RO_TYPE(osc, server_uuid);
 LPROC_SEQ_FOPS_RO_TYPE(osc, timeouts);
@@ -956,6 +986,7 @@ static struct attribute *osc_attrs[] = {
 	&lustre_attr_idle_timeout.attr,
 	&lustre_attr_idle_connect.attr,
 	&lustre_attr_grant_shrink.attr,
+	&lustre_attr_compression.attr,
 	NULL,
 };
 
