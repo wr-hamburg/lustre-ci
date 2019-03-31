@@ -996,12 +996,13 @@ struct obd_ops {
 	int (*o_preprw)(const struct lu_env *env, int cmd,
 			struct obd_export *exp, struct obdo *oa, int objcount,
 			struct obd_ioobj *obj, struct niobuf_remote *remote,
-			int *nr_pages, struct niobuf_local *local);
+			int *nr_pages, struct niobuf_local *local,
+			struct comp_chunk_desc *ccdesc);
 	int (*o_commitrw)(const struct lu_env *env, int cmd,
 			  struct obd_export *exp, struct obdo *oa,
 			  int objcount, struct obd_ioobj *obj,
 			  struct niobuf_remote *remote, int pages,
-			  struct niobuf_local *local, int rc);
+			  struct niobuf_local *local, int comped, int rc);
 	int (*o_init_export)(struct obd_export *exp);
 	int (*o_destroy_export)(struct obd_export *exp);
 

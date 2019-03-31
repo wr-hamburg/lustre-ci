@@ -45,6 +45,7 @@
 #include <lustre_disk.h>
 #include <lustre_fid.h>
 #include <lustre_quota.h>
+#include <lcomp.h>
 
 #include "osd_internal.h"
 
@@ -60,6 +61,9 @@
 #include <sys/dsl_prop.h>
 #include <sys/sa_impl.h>
 #include <sys/txg.h>
+#include <sys/dnode.h>
+
+#include <linux/delay.h>
 
 static char *osd_0copy_tag = "zerocopy";
 
@@ -379,7 +383,6 @@ static int osd_bufs_get_read(const struct lu_env *env, struct osd_object *obj,
 
 			bufoff = off - dbp[i]->db_offset;
 			tocpy = min_t(int, dbp[i]->db_size - bufoff, len);
-
 			/* kind of trick to differentiate dbuf vs. arcbuf */
 			LASSERT(((unsigned long)dbp[i] & 1) == 0);
 			dbf = (void *) ((unsigned long)dbp[i] | 1);
@@ -436,6 +439,24 @@ err:
 	RETURN(rc);
 }
 
+static inline arc_buf_t *osd_request_compressed_arcbuf(dnode_t *dn, int psize,
+				int lsize, enum zio_compress compression_type)
+{
+	arc_buf_t *abuf;
+
+	/*
+	abuf = dmu_request_compressed_arcbuf(&dn->dn_bonus->db, psize, lsize,
+				compression_type);
+	 */
+	CERROR("This code path requires patched ZFS servion, skipped here\n");
+	abuf = NULL;
+
+	if (unlikely(!abuf))
+		return ERR_PTR(-ENOMEM);
+
+	return abuf;
+}
+
 static inline arc_buf_t *osd_request_arcbuf(dnode_t *dn, size_t bs)
 {
 	arc_buf_t *abuf;
@@ -459,17 +480,63 @@ static inline arc_buf_t *osd_request_arcbuf(dnode_t *dn, size_t bs)
 	return abuf;
 }
 
+static void
+dnode_setdblksz(dnode_t *dn, int size)
+{
+	//ASSERT0(P2PHASE(size, SPA_MINBLOCKSIZE));
+	//ASSERT3U(size, <=, SPA_MAXBLOCKSIZE);
+	//ASSERT3U(size, >=, SPA_MINBLOCKSIZE);
+	//ASSERT3U(size >> SPA_MINBLOCKSHIFT, <,
+	//    1<<(sizeof (dn->dn_phys->dn_datablkszsec) * 8));
+	dn->dn_datablksz = size;
+	dn->dn_datablkszsec = size >> SPA_MINBLOCKSHIFT;
+	dn->dn_datablkshift = ISP2(size) ? highbit64(size - 1) : 0;
+}
+
 static int osd_bufs_get_write(const struct lu_env *env, struct osd_object *obj,
-			      loff_t off, ssize_t len, struct niobuf_local *lnb,
-			      int maxlnb)
+				loff_t off, ssize_t len,
+				struct niobuf_local *lnb, int maxlnb,
+				struct comp_chunk_desc *ccdesc)
 {
 	struct osd_device *osd = osd_obj2dev(obj);
-	int                poff, plen, off_in_block, sz_in_block;
-	int                rc, i = 0, npages = 0;
 	dnode_t *dn = obj->oo_dn;
 	arc_buf_t *abuf;
 	uint32_t bs = dn->dn_datablksz;
+	int decompress = 1;
+	int poff, plen, off_in_block = 0;
+	int sz_in_block;
+	int rc, i = 0, npages = 0;
+
 	ENTRY;
+
+	if (ccdesc) {
+		if (ccdesc->ccd_compressed && 
+					(ccdesc->ccd_decomp == L_CSERVER)) {
+			len = ccdesc->ccd_lsize;
+			decompress = 1;
+		}
+
+		if (ccdesc->ccd_compressed && 
+					(ccdesc->ccd_decomp != L_CSERVER)) {
+			/* reset dnode blocksize to chunksize; chunksize to
+			 * be recordsize; may be buggy here
+			 */
+			if (bs != ccdesc->ccd_chunksize) {
+				/* TODO:
+				 * May be very dirty and could fail? 
+				 * Matt Ahrens tells not to change the dnodesize
+				 * outside of a transaction, but how else here?
+				 * Smaller datablksz can not work with 
+				 * pre-compressed blocks/chunks.
+				 * To be tested even more.
+				 */
+				dnode_setdblksz(dn, ccdesc->ccd_chunksize);
+				bs = dn->dn_datablksz;
+			}
+			len = ccdesc->ccd_psize + ccdesc->ccd_header;
+			decompress = 0;
+		}
+	}
 
 	/*
 	 * currently only full blocks are subject to zerocopy approach:
@@ -479,17 +546,38 @@ static int osd_bufs_get_write(const struct lu_env *env, struct osd_object *obj,
 		if (unlikely(npages >= maxlnb))
 			GOTO(out_err, rc = -EOVERFLOW);
 
-		off_in_block = off & (bs - 1);
+		if (ccdesc && ccdesc->ccd_compressed && !decompress)
+			off_in_block = 0;
+		else
+			off_in_block = off & (bs - 1);
+
 		sz_in_block = min_t(int, bs - off_in_block, len);
 
 		abuf = NULL;
-		if (sz_in_block == bs) {
+
+		if (!(ccdesc && ccdesc->ccd_compressed) && sz_in_block == bs) {
 			/* full block, try to use zerocopy */
 			abuf = osd_request_arcbuf(dn, bs);
 			if (unlikely(IS_ERR(abuf)))
 				GOTO(out_err, rc = PTR_ERR(abuf));
 		}
 
+		/* in compressed case we should have 1 block/chunk, 1 loop */
+		if (ccdesc && ccdesc->ccd_compressed && !decompress) {
+			/* full logical block, try to use zerocopy */
+			/* compressed block can be less than page_size,
+			 * but requested abuf should be at least PAGE_SIZE
+			 */
+			plen = ccdesc->ccd_psize + ccdesc->ccd_header;
+			if (plen < PAGE_SIZE)
+				plen = PAGE_SIZE;
+			abuf = osd_request_compressed_arcbuf(dn, plen,
+							ccdesc->ccd_chunksize,
+							ZIO_COMPRESS_LZ4);
+			if (unlikely(IS_ERR(abuf)))
+				GOTO(out_err, rc = PTR_ERR(abuf));
+			abuf->b_flags &= ARC_BUF_FLAG_COMPRESSED;
+		}
 		if (abuf != NULL) {
 			atomic_inc(&osd->od_zerocopy_loan);
 
@@ -505,7 +593,12 @@ static int osd_bufs_get_write(const struct lu_env *env, struct osd_object *obj,
 				lnb[i].lnb_page_offset = 0;
 				lnb[i].lnb_len = plen;
 				lnb[i].lnb_rc = 0;
-				if (sz_in_block == bs)
+
+				/* we have compressed only full blocks,
+				 * 1 loop, 1 buf per block
+				 */
+				if ((ccdesc && ccdesc->ccd_compressed && i == 0)
+							|| sz_in_block == bs)
 					lnb[i].lnb_data = abuf;
 				else
 					lnb[i].lnb_data = NULL;
@@ -526,6 +619,9 @@ static int osd_bufs_get_write(const struct lu_env *env, struct osd_object *obj,
 				npages++;
 			}
 		} else {
+			/* No compression checks here since we compress
+			 * only full blocks!
+			 */
 			if (off_in_block == 0 && len < bs &&
 					off + len >= obj->oo_attr.la_size)
 				lprocfs_counter_add(osd->od_stats,
@@ -578,7 +674,9 @@ out_err:
 
 static int osd_bufs_get(const struct lu_env *env, struct dt_object *dt,
 			loff_t offset, ssize_t len, struct niobuf_local *lnb,
-			int maxlnb, enum dt_bufs_type rw)
+			int maxlnb,
+			struct comp_chunk_desc *ccdesc,
+			enum dt_bufs_type rw)
 {
 	struct osd_object *obj  = osd_dt_obj(dt);
 	int                rc;
@@ -587,7 +685,8 @@ static int osd_bufs_get(const struct lu_env *env, struct dt_object *dt,
 	LASSERT(obj->oo_dn);
 
 	if (rw & DT_BUFS_TYPE_WRITE)
-		rc = osd_bufs_get_write(env, obj, offset, len, lnb, maxlnb);
+		rc = osd_bufs_get_write(env, obj, offset, len, lnb, maxlnb,
+					ccdesc);
 	else
 		rc = osd_bufs_get_read(env, obj, offset, len, lnb, maxlnb);
 
@@ -817,7 +916,7 @@ static void osd_evict_dbufs_after_write(struct osd_object *obj,
 
 static int osd_write_commit(const struct lu_env *env, struct dt_object *dt,
 			struct niobuf_local *lnb, int npages,
-			struct thandle *th)
+			struct thandle *th, int comped)
 {
 	struct osd_object  *obj  = osd_dt_obj(dt);
 	struct osd_device  *osd = osd_obj2dev(obj);
@@ -834,9 +933,12 @@ static int osd_write_commit(const struct lu_env *env, struct dt_object *dt,
 	oh = container_of0(th, struct osd_thandle, ot_super);
 
 	/* adjust block size. Assume the buffers are sorted. */
-	(void)osd_grow_blocksize(obj, oh, lnb[0].lnb_file_offset,
-				 lnb[npages - 1].lnb_file_offset +
-				 lnb[npages - 1].lnb_len);
+	/* DO NOT GROW or shrink BLOCKSIZE WHEN COMPRESSED*/
+	if (!comped) {
+		(void)osd_grow_blocksize(obj, oh, lnb[0].lnb_file_offset,
+					 lnb[npages - 1].lnb_file_offset +
+					 lnb[npages - 1].lnb_len);
+	}
 
 	if (obj->oo_attr.la_size >= osd->od_readcache_max_filesize ||
 	    lnb[npages - 1].lnb_file_offset + lnb[npages - 1].lnb_len >=
@@ -907,12 +1009,17 @@ static int osd_write_commit(const struct lu_env *env, struct dt_object *dt,
 			 * in this case it fallbacks to dmu_write() */
 			abufsz = arc_buf_size(lnb[i].lnb_data);
 			LASSERT(abufsz & PAGE_MASK);
+
 			apages = abufsz / PAGE_SIZE;
+			if (abufsz % PAGE_SIZE > 0)
+				apages++;
+
 			LASSERT(i + apages <= npages);
 			/* these references to pages must be invalidated
 			 * to prevent access in osd_bufs_put() */
 			for (j = 0; j < apages; j++)
 				lnb[i + j].lnb_page = NULL;
+
 			dmu_assign_arcbuf(&obj->oo_dn->dn_bonus->db,
 					  lnb[i].lnb_file_offset,
 					  lnb[i].lnb_data, oh->ot_tx);

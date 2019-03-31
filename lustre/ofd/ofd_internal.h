@@ -323,11 +323,11 @@ int ofd_verify_layout_version(const struct lu_env *env,
 int ofd_preprw(const struct lu_env *env,int cmd, struct obd_export *exp,
 	       struct obdo *oa, int objcount, struct obd_ioobj *obj,
 	       struct niobuf_remote *rnb, int *nr_local,
-	       struct niobuf_local *lnb);
+	       struct niobuf_local *lnb, struct comp_chunk_desc *ccdesc);
 int ofd_commitrw(const struct lu_env *env, int cmd, struct obd_export *exp,
 		 struct obdo *oa, int objcount, struct obd_ioobj *obj,
 		 struct niobuf_remote *rnb, int npages,
-		 struct niobuf_local *lnb, int old_rc);
+		 struct niobuf_local *lnb, int comped, int old_rc);
 
 /* ofd_trans.c */
 struct thandle *ofd_trans_create(const struct lu_env *env,

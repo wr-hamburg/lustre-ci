@@ -1208,6 +1208,7 @@ struct dt_body_operations {
 			    ssize_t len,
 			    struct niobuf_local *lb,
 			    int maxlnb,
+			    struct comp_chunk_desc *ccdesc,
 			    enum dt_bufs_type rw);
 
 	/**
@@ -1322,6 +1323,7 @@ struct dt_body_operations {
 	 * \param[in] lb	array of descriptors for the buffers
 	 * \param[in] nr	size of the array
 	 * \param[in] th	transaction handle
+	 * \param[in] comped	compressed or not
 	 *
 	 * \retval 0		on success
 	 * \retval negative	negated errno on error
@@ -1330,7 +1332,8 @@ struct dt_body_operations {
 				struct dt_object *dt,
 				struct niobuf_local *lb,
 				int nr,
-				struct thandle *th);
+				struct thandle *th,
+				int comped);
 
 	/**
 	 * Return logical to physical block mapping for a given extent
@@ -2412,14 +2415,16 @@ static inline int dt_ref_del(const struct lu_env *env,
 static inline int dt_bufs_get(const struct lu_env *env, struct dt_object *d,
 			      struct niobuf_remote *rnb,
 			      struct niobuf_local *lnb, int maxlnb,
+			      struct comp_chunk_desc *ccdesc,
 			      enum dt_bufs_type rw)
 {
 	LASSERT(d);
 	LASSERT(d->do_body_ops);
 	LASSERT(d->do_body_ops->dbo_bufs_get);
 	return d->do_body_ops->dbo_bufs_get(env, d, rnb->rnb_offset,
-					    rnb->rnb_len, lnb, maxlnb, rw);
+					rnb->rnb_len, lnb, maxlnb, ccdesc, rw);
 }
+
 
 static inline int dt_bufs_put(const struct lu_env *env, struct dt_object *d,
                               struct niobuf_local *lnb, int n)
@@ -2451,13 +2456,14 @@ static inline int dt_declare_write_commit(const struct lu_env *env,
 
 
 static inline int dt_write_commit(const struct lu_env *env,
-                                  struct dt_object *d, struct niobuf_local *lnb,
-                                  int n, struct thandle *th)
+				struct dt_object *d, struct niobuf_local *lnb,
+				int n, struct thandle *th,
+				int comped)
 {
         LASSERT(d);
         LASSERT(d->do_body_ops);
         LASSERT(d->do_body_ops->dbo_write_commit);
-        return d->do_body_ops->dbo_write_commit(env, d, lnb, n, th);
+	return d->do_body_ops->dbo_write_commit(env, d, lnb, n, th, comped);
 }
 
 static inline int dt_read_prep(const struct lu_env *env, struct dt_object *d,

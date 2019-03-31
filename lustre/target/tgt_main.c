@@ -34,6 +34,8 @@
 #define DEBUG_SUBSYSTEM S_CLASS
 
 #include <obd.h>
+#include <lcomp.h>
+
 #include "tgt_internal.h"
 #include "../ptlrpc/ptlrpc_internal.h"
 
@@ -732,6 +734,14 @@ int tgt_mod_init(void)
 	if (result != 0)
 		RETURN(result);
 
+	/* cmp_pool_init (number_of_buffers, size_of_buffers (in bytes))
+	 * TODO: number_of_buffers = MAX(32, number_of_cpus) * default_RPC_size
+	 * TODO: size_of_buffers =  get ZFS record size
+	 * TODO: make settable, not hard compiled
+	 * TODO: will change with lz4 frame usage
+	 */
+	cmp_pool_init(50, 2*64 * 1024);
+
 	tgt_page_to_corrupt = alloc_page(GFP_KERNEL);
 
 	tgt_key_init_generic(&tgt_thread_key, NULL);
@@ -754,6 +764,9 @@ void tgt_mod_exit(void)
 
 	lu_context_key_degister(&tgt_thread_key);
 	lu_context_key_degister(&tgt_session_key);
+
+	cmp_pool_free(); /* release pages at the end */
+
 	update_info_fini();
 
 	lu_kmem_fini(tgt_caches);

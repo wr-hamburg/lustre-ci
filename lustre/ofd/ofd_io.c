@@ -44,6 +44,8 @@
 #include "ofd_internal.h"
 #include <lustre_nodemap.h>
 
+#include <linux/delay.h>
+
 struct ofd_inconsistency_item {
 	struct list_head	 oii_list;
 	struct ofd_object	*oii_obj;
@@ -500,7 +502,8 @@ static int ofd_preprw_read(const struct lu_env *env, struct obd_export *exp,
 			   struct ofd_device *ofd, const struct lu_fid *fid,
 			   struct lu_attr *la, struct obdo *oa, int niocount,
 			   struct niobuf_remote *rnb, int *nr_local,
-			   struct niobuf_local *lnb, char *jobid)
+			   struct niobuf_local *lnb,
+			   struct comp_chunk_desc *ccdesc, char *jobid)
 {
 	struct ofd_object *fo;
 	int i, j, rc, tot_bytes = 0;
@@ -534,7 +537,7 @@ static int ofd_preprw_read(const struct lu_env *env, struct obd_export *exp,
 			rnb[i].rnb_len = 100 * 1024 * 1024;
 
 		rc = dt_bufs_get(env, ofd_object_child(fo), rnb + i,
-				 lnb + j, maxlnb, dbt);
+				 lnb + j, maxlnb, NULL, dbt);
 		if (unlikely(rc < 0))
 			GOTO(buf_put, rc);
 		LASSERT(rc <= PTLRPC_MAX_BRW_PAGES);
@@ -584,6 +587,7 @@ unlock:
  * \param[in] rnb	remote buffers
  * \param[in] nr_local	number of local buffers
  * \param[in] lnb	local buffers
+ * \param[in] ccdesc	chunk descriptor (compression)
  * \param[in] jobid	job ID name
  *
  * \retval		0 on successful prepare
@@ -594,12 +598,16 @@ static int ofd_preprw_write(const struct lu_env *env, struct obd_export *exp,
 			    struct lu_attr *la, struct obdo *oa,
 			    int objcount, struct obd_ioobj *obj,
 			    struct niobuf_remote *rnb, int *nr_local,
-			    struct niobuf_local *lnb, char *jobid)
+			    struct niobuf_local *lnb,
+			    struct comp_chunk_desc *ccdesc, char *jobid)
 {
 	struct ofd_object *fo;
 	int i, j, k, rc = 0, tot_bytes = 0;
 	enum dt_bufs_type dbt = DT_BUFS_TYPE_WRITE;
 	int maxlnb = *nr_local;
+	int c_tot_bytes = 0;
+	int c_nr_local = 0;
+	int pages = 0;
 
 	ENTRY;
 	LASSERT(env != NULL);
@@ -709,23 +717,58 @@ static int ofd_preprw_write(const struct lu_env *env, struct obd_export *exp,
 	for (*nr_local = 0, i = 0, j = 0; i < obj->ioo_bufcnt; i++) {
 		if (OBD_FAIL_CHECK(OBD_FAIL_OST_2BIG_NIOBUF))
 			rnb[i].rnb_len += PAGE_SIZE;
-		rc = dt_bufs_get(env, ofd_object_child(fo),
-				 rnb + i, lnb + j, maxlnb, dbt);
+
+		if (ccdesc) {
+			/* rc returns lpages in compressed case */
+			rc = dt_bufs_get(env, ofd_object_child(fo),
+				rnb + i, lnb + j, maxlnb, ccdesc + i, dbt);
+		} else {
+			rc = dt_bufs_get(env, ofd_object_child(fo),
+					 rnb + i, lnb + j, maxlnb, NULL, dbt);
+		}
+
 		if (unlikely(rc < 0))
 			GOTO(err, rc);
 		LASSERT(rc <= PTLRPC_MAX_BRW_PAGES);
 		/* correct index for local buffers to continue with */
-		for (k = 0; k < rc; k++) {
+		if (ccdesc && ccdesc[i].ccd_lsize != 0)
+			pages = ccdesc[i].ccd_ppages;
+		else
+			pages = rc;
+
+		for (k = 0; k < pages; k++) {
 			lnb[j+k].lnb_flags = rnb[i].rnb_flags;
 			lnb[j+k].lnb_flags &= ~OBD_BRW_LOCALS;
+			/* TODO: only first #ppages of lnb-pages get
+			 * OBD_BRW_GRANTED flag, the remaining ones do not.
+			 * Have they also been granted? Fix
+			 */
 			if (!(rnb[i].rnb_flags & OBD_BRW_GRANTED))
 				lnb[j+k].lnb_rc = -ENOSPC;
 		}
 		j += rc;
 		*nr_local += rc;
 		maxlnb -= rc;
+
+		if (ccdesc) {
+			c_nr_local += (ccdesc[i].ccd_psize +
+					ccdesc[i].ccd_header) / PAGE_SIZE;
+			if ((ccdesc[i].ccd_psize + ccdesc[i].ccd_header)
+						% PAGE_SIZE > 0)
+				c_nr_local = c_nr_local + 1;
+		}
 		LASSERT(j <= PTLRPC_MAX_BRW_PAGES);
 		tot_bytes += rnb[i].rnb_len;
+
+		if (ccdesc && ccdesc[i].ccd_lsize != 0) {
+			c_nr_local += (ccdesc[i].ccd_psize +
+					ccdesc[i].ccd_header) / PAGE_SIZE;
+			if ((ccdesc[i].ccd_psize + ccdesc[i].ccd_header)
+						% PAGE_SIZE > 0)
+				c_nr_local++;
+			c_tot_bytes += (ccdesc[i].ccd_psize
+					+ ccdesc[i].ccd_header);
+		}
 	}
 	LASSERT(*nr_local > 0 && *nr_local <= PTLRPC_MAX_BRW_PAGES);
 
@@ -734,10 +777,15 @@ static int ofd_preprw_write(const struct lu_env *env, struct obd_export *exp,
 		GOTO(err, rc);
 
 	ofd_read_unlock(env, fo);
+	/* TODO: tot_bytes or c_tot_bytes? */
 	ofd_counter_incr(exp, LPROC_OFD_STATS_WRITE, jobid, tot_bytes);
 	RETURN(0);
 err:
-	dt_bufs_put(env, ofd_object_child(fo), lnb, *nr_local);
+	if (c_nr_local != 0)
+		/* TODO nr_local or c_nr_local ? */
+		dt_bufs_put(env, ofd_object_child(fo), lnb, c_nr_local);
+	else
+		dt_bufs_put(env, ofd_object_child(fo), lnb, *nr_local);
 	ofd_read_unlock(env, fo);
 	ofd_object_put(env, fo);
 	/* tgt_grant_prepare_write() was called, so we must commit */
@@ -772,7 +820,7 @@ out:
 int ofd_preprw(const struct lu_env *env, int cmd, struct obd_export *exp,
 	       struct obdo *oa, int objcount, struct obd_ioobj *obj,
 	       struct niobuf_remote *rnb, int *nr_local,
-	       struct niobuf_local *lnb)
+	       struct niobuf_local *lnb, struct comp_chunk_desc *ccdesc)
 {
 	struct tgt_session_info	*tsi = tgt_ses_info(env);
 	struct ofd_device	*ofd = ofd_exp(exp);
@@ -825,12 +873,13 @@ int ofd_preprw(const struct lu_env *env, int cmd, struct obd_export *exp,
 	if (cmd == OBD_BRW_WRITE) {
 		la_from_obdo(&info->fti_attr, oa, OBD_MD_FLGETATTR);
 		rc = ofd_preprw_write(env, exp, ofd, fid, &info->fti_attr, oa,
-				      objcount, obj, rnb, nr_local, lnb, jobid);
+				      objcount, obj, rnb, nr_local, lnb, ccdesc,
+				      jobid);
 	} else if (cmd == OBD_BRW_READ) {
 		tgt_grant_prepare_read(env, exp, oa);
 		rc = ofd_preprw_read(env, exp, ofd, fid, &info->fti_attr, oa,
 				     obj->ioo_bufcnt, rnb, nr_local, lnb,
-				     jobid);
+				     ccdesc, jobid);
 		obdo_from_la(oa, &info->fti_attr, LA_ATIME);
 	} else {
 		CERROR("%s: wrong cmd %d received!\n",
@@ -1089,7 +1138,7 @@ ofd_commitrw_write(const struct lu_env *env, struct obd_export *exp,
 		   struct ofd_device *ofd, const struct lu_fid *fid,
 		   struct lu_attr *la, struct obdo *oa, int objcount,
 		   int niocount, struct niobuf_local *lnb,
-		   unsigned long granted, int old_rc)
+		   unsigned long granted, int comped, int old_rc)
 {
 	struct ofd_thread_info *info = ofd_info(env);
 	struct filter_export_data *fed = &exp->exp_filter_data;
@@ -1195,7 +1244,7 @@ retry:
 		GOTO(out_unlock, rc = -ENOENT);
 
 	if (likely(!fake_write)) {
-		rc = dt_write_commit(env, o, lnb, niocount, th);
+		rc = dt_write_commit(env, o, lnb, niocount, th, comped);
 		if (rc)
 			GOTO(out_unlock, rc);
 	}
@@ -1281,7 +1330,8 @@ out:
 int ofd_commitrw(const struct lu_env *env, int cmd, struct obd_export *exp,
 		 struct obdo *oa, int objcount, struct obd_ioobj *obj,
 		 struct niobuf_remote *rnb, int npages,
-		 struct niobuf_local *lnb, int old_rc)
+		 struct niobuf_local *lnb,
+		int comped, int old_rc)
 {
 	struct ofd_thread_info *info = ofd_info(env);
 	struct ofd_device *ofd = ofd_exp(exp);
@@ -1300,7 +1350,7 @@ int ofd_commitrw(const struct lu_env *env, int cmd, struct obd_export *exp,
 
 		rc = ofd_commitrw_write(env, exp, ofd, fid, &info->fti_attr,
 					oa, objcount, npages, lnb,
-					oa->o_grant_used, old_rc);
+					oa->o_grant_used, comped, old_rc);
 		if (rc == 0)
 			obdo_from_la(oa, &info->fti_attr,
 				     OFD_VALID_FLAGS | LA_GID | LA_UID |

@@ -46,9 +46,10 @@
 #include <lustre_lfsck.h>
 #include <lustre_nodemap.h>
 #include <lustre_acl.h>
+#include <lcomp.h>
 
 #include "tgt_internal.h"
-
+#include <linux/delay.h>
 char *tgt_name(struct lu_target *tgt)
 {
 	LASSERT(tgt->lut_obd != NULL);
@@ -1741,12 +1742,13 @@ static void tgt_brw_unlock(struct obd_ioobj *obj, struct niobuf_remote *niob,
 static int tgt_checksum_niobuf(struct lu_target *tgt,
 				 struct niobuf_local *local_nb, int npages,
 				 int opc, enum cksum_types cksum_type,
-				 __u32 *cksum)
+				 __u32 *cksum, int *plens)
 {
 	struct ahash_request	       *req;
 	unsigned int			bufsize;
 	int				i, err;
 	unsigned char			cfs_alg = cksum_obd2cfs(cksum_type);
+	int len = 0;
 
 	req = cfs_crypto_hash_init(cfs_alg, NULL, 0);
 	if (IS_ERR(req)) {
@@ -1757,12 +1759,18 @@ static int tgt_checksum_niobuf(struct lu_target *tgt,
 
 	CDEBUG(D_INFO, "Checksum for algo %s\n", cfs_crypto_hash_name(cfs_alg));
 	for (i = 0; i < npages; i++) {
+		/* In compressed write case, we need here physical page lens,
+		 * lnb has logical ones
+		 */
+		if (opc == OST_WRITE && plens != NULL)
+			len = plens[i];
+		else
+			len = local_nb[i].lnb_len;
 		/* corrupt the data before we compute the checksum, to
 		 * simulate a client->OST data error */
 		if (i == 0 && opc == OST_WRITE &&
 		    OBD_FAIL_CHECK(OBD_FAIL_OST_CHECKSUM_RECEIVE)) {
 			int off = local_nb[i].lnb_page_offset & ~PAGE_MASK;
-			int len = local_nb[i].lnb_len;
 			struct page *np = tgt_page_to_corrupt;
 
 			if (np) {
@@ -1788,14 +1796,13 @@ static int tgt_checksum_niobuf(struct lu_target *tgt,
 		}
 		cfs_crypto_hash_update_page(req, local_nb[i].lnb_page,
 				  local_nb[i].lnb_page_offset & ~PAGE_MASK,
-				  local_nb[i].lnb_len);
+				  len);
 
 		 /* corrupt the data after we compute the checksum, to
 		 * simulate an OST->client data error */
 		if (i == 0 && opc == OST_READ &&
 		    OBD_FAIL_CHECK(OBD_FAIL_OST_CHECKSUM_SEND)) {
 			int off = local_nb[i].lnb_page_offset & ~PAGE_MASK;
-			int len = local_nb[i].lnb_len;
 			struct page *np = tgt_page_to_corrupt;
 
 			if (np) {
@@ -1968,7 +1975,9 @@ static int tgt_checksum_niobuf_t10pi(struct lu_target *tgt,
 				     int npages, int opc,
 				     obd_dif_csum_fn *fn,
 				     int sector_size,
-				     u32 *check_sum)
+				     u32 *check_sum,
+				     int *plens)
+	/* TODO: use plens when compressed */
 {
 	enum cksum_types t10_cksum_type = tgt->lut_dt_conf.ddp_t10_cksum_type;
 	unsigned char cfs_alg = cksum_obd2cfs(OBD_CKSUM_T10_TOP);
@@ -2000,12 +2009,19 @@ static int tgt_checksum_niobuf_t10pi(struct lu_target *tgt,
 	guard_start = (__u16 *)buffer;
 	guard_number = PAGE_SIZE / sizeof(*guard_start);
 	for (i = 0; i < npages; i++) {
+		int len;
+		/* In compressed write case, we need here physical page lens,
+		 * lnb has logical ones
+		 */
+		if (opc == OST_WRITE && plens != NULL)
+			len = plens[i];
+		else
+			len = local_nb[i].lnb_len;
 		/* corrupt the data before we compute the checksum, to
 		 * simulate a client->OST data error */
 		if (i == 0 && opc == OST_WRITE &&
 		    OBD_FAIL_CHECK(OBD_FAIL_OST_CHECKSUM_RECEIVE)) {
 			int off = local_nb[i].lnb_page_offset & ~PAGE_MASK;
-			int len = local_nb[i].lnb_len;
 			struct page *np = tgt_page_to_corrupt;
 
 			if (np) {
@@ -2036,7 +2052,7 @@ static int tgt_checksum_niobuf_t10pi(struct lu_target *tgt,
 		 */
 		if (t10_cksum_type && opc == OST_READ &&
 		    local_nb[i].lnb_guard_disk) {
-			used = DIV_ROUND_UP(local_nb[i].lnb_len, sector_size);
+			used = DIV_ROUND_UP(len, sector_size);
 			if (used > (guard_number - used_number)) {
 				rc = -E2BIG;
 				break;
@@ -2048,7 +2064,7 @@ static int tgt_checksum_niobuf_t10pi(struct lu_target *tgt,
 			rc = obd_page_dif_generate_buffer(obd_name,
 				local_nb[i].lnb_page,
 				local_nb[i].lnb_page_offset & ~PAGE_MASK,
-				local_nb[i].lnb_len, guard_start + used_number,
+				len, guard_start + used_number,
 				guard_number - used_number, &used, sector_size,
 				fn);
 			if (rc)
@@ -2086,7 +2102,6 @@ static int tgt_checksum_niobuf_t10pi(struct lu_target *tgt,
 		if (unlikely(i == 0 && opc == OST_READ &&
 			     OBD_FAIL_CHECK(OBD_FAIL_OST_CHECKSUM_SEND))) {
 			int off = local_nb[i].lnb_page_offset & ~PAGE_MASK;
-			int len = local_nb[i].lnb_len;
 			struct page *np = tgt_page_to_corrupt;
 
 			if (np) {
@@ -2132,7 +2147,8 @@ out:
 static int tgt_checksum_niobuf_rw(struct lu_target *tgt,
 				  enum cksum_types cksum_type,
 				  struct niobuf_local *local_nb,
-				  int npages, int opc, u32 *check_sum)
+				  int npages, int opc, u32 *check_sum,
+				  int *plens)
 {
 	obd_dif_csum_fn *fn = NULL;
 	int sector_size = 0;
@@ -2144,10 +2160,10 @@ static int tgt_checksum_niobuf_rw(struct lu_target *tgt,
 	if (fn)
 		rc = tgt_checksum_niobuf_t10pi(tgt, local_nb, npages,
 					       opc, fn, sector_size,
-					       check_sum);
+					       check_sum, plens);
 	else
 		rc = tgt_checksum_niobuf(tgt, local_nb, npages, opc,
-					 cksum_type, check_sum);
+					 cksum_type, check_sum, plens);
 	RETURN(rc);
 }
 
@@ -2160,6 +2176,7 @@ int tgt_brw_read(struct tgt_session_info *tsi)
 	struct niobuf_local	*local_nb;
 	struct obd_ioobj	*ioo;
 	struct ost_body		*body, *repbody;
+	struct comp_chunk_desc	*ccdesc = NULL;
 	struct lustre_handle	 lockh = { 0 };
 	int			 npages, nob = 0, rc, i, no_reply = 0,
 				 npages_read;
@@ -2235,7 +2252,7 @@ int tgt_brw_read(struct tgt_session_info *tsi)
 
 	npages = PTLRPC_MAX_BRW_PAGES;
 	rc = obd_preprw(tsi->tsi_env, OBD_BRW_READ, exp, &repbody->oa, 1,
-			ioo, remote_nb, &npages, local_nb);
+			ioo, remote_nb, &npages, local_nb, ccdesc);
 	if (rc != 0)
 		GOTO(out_lock, rc);
 
@@ -2293,7 +2310,7 @@ int tgt_brw_read(struct tgt_session_info *tsi)
 
 		rc = tgt_checksum_niobuf_rw(tsi->tsi_tgt, cksum_type,
 					    local_nb, npages_read, OST_READ,
-					    &repbody->oa.o_cksum);
+					    &repbody->oa.o_cksum, NULL);
 		if (rc < 0)
 			GOTO(out_commitrw, rc);
 		CDEBUG(D_PAGE, "checksum at read origin: %x\n",
@@ -2347,7 +2364,7 @@ int tgt_brw_read(struct tgt_session_info *tsi)
 out_commitrw:
 	/* Must commit after prep above in all cases */
 	rc = obd_commitrw(tsi->tsi_env, OBD_BRW_READ, exp, &repbody->oa, 1, ioo,
-			  remote_nb, npages, local_nb, rc);
+			  remote_nb, npages, local_nb, 0, rc);
 out_lock:
 	tgt_brw_unlock(ioo, remote_nb, &lockh, LCK_PR);
 
@@ -2457,6 +2474,221 @@ static void tgt_warn_on_cksum(struct ptlrpc_request *req,
 			   client_cksum, server_cksum);
 }
 
+/**
+ * Decompress chunks with a decompresser that can handle pages arrays
+ *
+ * \param[in] cmd		write or read, current support only for write
+ * \param[in] page_count	original page count
+ * \param[in, out] lnb		local network IO buffers of logical sizes, which
+ *				contain compressed data on input and
+ *				decompressed data on output
+ * \param[in] chunks	number of chunks/rnbs
+ * \param[in] ccdesc	comp chunk descriptor
+ * \param[in] plens		array of physical page sizes in a row
+ *
+ * \retval      0 on successful prepare
+ * \retval      negative value on error
+ */
+int decompress_pga(int cmd, u32 page_count, struct niobuf_local	*lnb,
+		   int chunks, struct comp_chunk_desc *ccdesc, int *plens)
+{
+	/* TODO */
+	return -1;
+}
+
+/**
+ * Decompress chunks with a decompressor that can handle contiguous buffers
+ *
+ * \param[in] cmd		write or read, current support only for write
+ * \param[in] page_count	original page count
+ * \param[in, out] lnb		local network IO buffers of logical sizes, which
+ *				contain compressed data on input and
+ *				decompressed data on output
+ * \param[in] chunks		number of chunks/rnbs
+ * \param[in] ccdesc		chunk descriptor
+ * \param[in] plens		array of physical page sizes in a row
+ *
+ * \retval      0 on successful prepare
+ * \retval      negative value on error
+ */
+int decompress_cbuf(int cmd, u32 page_count, struct niobuf_local *lnb,
+			int chunks, struct comp_chunk_desc *ccdesc, int *plens)
+{
+	int page = 0;	/* local page index */
+	int p = 0;	/* global page index*/
+	int c = 0;	/* chunk index */
+	/* dst: array of output buffers for decompressed data */
+	unsigned char **dst = NULL;
+	/* src: source address of the original data */
+	unsigned char *src = NULL;
+	/* address of the working memory of size LZ4_MEM_COMPRESS */
+	void *wrkmem = NULL;
+	/* number of decomprsd bytes per chunk*/
+	size_t decomprsd = 0;
+	/* initial size of a chunk/ZFS record in bytes */
+	int chunksize = 0;
+	/* failure return value */
+	int rc = 0;
+	/* how many buffers decompressed */
+	int decomped = 0;
+
+	/* TODO: add read path */
+	if (cmd != OBD_BRW_WRITE)
+		RETURN(-ENOMEM);
+
+	/*  Wrong for 1 chunk and for chunks smaller than chunksize.
+	 *  TODO: get record size from ZFS, then put the following assert:
+	 *  LASSERT(chunksize % PAGE_SIZE == 0);
+	 */
+	chunksize = ccdesc[0].ccd_lsize;
+
+	OBD_ALLOC(dst, chunks * sizeof(unsigned char *));
+	if (dst == NULL)	{
+		rc = ENOMEM;
+		goto free;
+	}
+
+	/* Atomic get of several buffers. Will fail if the requested number is
+	 * not available at once.
+	 */
+	rc = cmp_pool_get_many_buffers(chunks, chunksize, (void **)dst);
+	if (rc != 0)
+		goto free;
+
+	src = cmp_pool_get_page_buffer(chunksize);
+	if (src == NULL) {
+		rc = ENOMEM;
+		goto free;
+	}
+
+	OBD_ALLOC_LARGE(wrkmem, LZ4_MEM_COMPRESS);
+	if (wrkmem == NULL) {
+		rc = ENOMEM;
+		goto free;
+	}
+
+	for (c = 0; c < chunks; c++) {
+		/* TODO more generic for different algos */
+
+		/* Chunk was compressed, decompress it */
+		if (likely(ccdesc[c].ccd_algo != L_COMPRESS_OFF)) {
+			/* Check whether all lnb-pages within 1
+			 * chunk are contiguous. If so, we do not
+			 * need to memcopy the chunk to src.
+			 */
+			for (page = 0; page < ccdesc[c].ccd_ppages-1; page++)
+				if (lnb[p + page].lnb_page+1
+				    != lnb[p + page + 1].lnb_page)
+					break;
+
+			if (page == ccdesc[c].ccd_ppages-1) {
+				decomprsd = LZ4_decompress_safe(
+						(page_address(lnb[p].lnb_page))
+						+ ccdesc[c].ccd_header, dst[c],
+						ccdesc[c].ccd_psize,
+						ccdesc[c].ccd_lsize);
+
+			} else {
+				for (page = 0; page < ccdesc[c].ccd_ppages;
+									page++)
+					memcpy(src + page * PAGE_SIZE,
+					     page_address(lnb[p+page].lnb_page),
+					     PAGE_SIZE);
+
+				decomprsd = LZ4_decompress_safe(src
+						+ ccdesc[c].ccd_header, dst[c],
+						ccdesc[c].ccd_psize,
+						ccdesc[c].ccd_lsize);
+			}
+			/* Chunk could not be decompressed.
+			 * TODO: recoverable?
+			 */
+			if (decomprsd <= 0 || decomprsd
+						!= ccdesc[c].ccd_lsize) {
+				rc = ENOMEM;
+				goto free;
+			}
+			decomped++;
+		} else {
+		/* Chunk was not compressed, unfortunately need a memcopy
+		 * anyway. Dst must be first completed with final data before
+		 * we can fill lnb-pages. Otherwise we would overwrite not yet
+		 * decompressed	data
+		 */
+			for (page = 0; page < ccdesc[c].ccd_ppages; page++)
+				memcpy(dst[c] + page * PAGE_SIZE,
+				       page_address(lnb[p + page].lnb_page),
+				       PAGE_SIZE);
+		}
+		p = p + ccdesc[c].ccd_ppages;
+	}
+
+	for (p = c = 0; c < chunks; c++) {
+		for (page = 0; page < ccdesc[c].ccd_lpages; page++, p++) {
+			memcpy(page_address(lnb[p].lnb_page),
+					dst[c] + page * PAGE_SIZE,
+					PAGE_SIZE);
+					/* TODO: PAGE_SIZE as last argument may
+					 * be wrong for RMW
+					 */
+		}
+		ccdesc[c].ccd_compressed = 0;
+	}
+
+free:
+	if (wrkmem != NULL)
+		OBD_FREE_LARGE(wrkmem, LZ4_MEM_COMPRESS);
+	if (src != NULL)
+		cmp_pool_return_page_buffer(src);
+	if (dst != NULL) {
+		for (c = 0; c < chunks; c++)
+			if (dst[c] != NULL)
+				cmp_pool_return_page_buffer(dst[c]);
+
+		OBD_FREE(dst, chunks * sizeof(unsigned char *));
+	}
+
+	if (rc != 0)
+		RETURN(-ENOMEM);
+	return decomped;
+}
+
+/**
+ * Decompress data from lnb and copy back to lnb.
+ * Deisgned for write path: when reading compressed data and wanted
+ * it to be decompressed by server, ZFS would decompress it (due to
+ * algo/layout compatibility).
+ *
+ * \param[in] cmd           write or read, current support only for write
+ * \param[in] page_count    original page count
+ * \param[in, out] lnb      local network IO buffers of logical sizes, which
+ *                          contain compressed data on input and decompressed
+ *                          data on output
+ * \param[in] chunks        number of chunks/rnbs
+ * \param[in] ccdesc         chunk descriptor
+ * \param[in] plens         array of physical page sizes in a row
+ *
+ * \retval      number of decompressed chunks
+ */
+int decompress_data(int cmd, u32 page_count, struct niobuf_local *lnb,
+			int chunks, struct comp_chunk_desc *ccdesc, int *plens)
+{
+	/* TODO: make a restriction for one compression type per file or
+	 * decompress every chunk completely separate
+	 */
+	int dchunks;
+
+	if (CAN_PGA(ccdesc[0].ccd_algo))
+		dchunks = decompress_pga(cmd, page_count, lnb, chunks, ccdesc,
+				     plens);
+
+	if (CAN_CBUF(ccdesc[0].ccd_algo))
+		dchunks = decompress_cbuf(cmd, page_count, lnb, chunks, ccdesc,
+				      plens);
+
+	return dchunks;
+}
+
 int tgt_brw_write(struct tgt_session_info *tsi)
 {
 	struct ptlrpc_request	*req = tgt_ses_req(tsi);
@@ -2476,7 +2708,69 @@ int tgt_brw_write(struct tgt_session_info *tsi)
 	bool wait_sync = false;
 	const char *obd_name = exp->exp_obd->obd_name;
 
+	/* Additional stuff for decompression */
+	struct comp_chunk_desc *ccdesc = NULL;	/* chunk descriptor */
+	int *plens = NULL;  /* page size of compressed pages in a row */
+	int chunks = 0;     /* number of chunks/niobufs */
+	int c = 0;          /* chunk index */
+	int p = 0;          /* page index */
+	int c_npages = 0;   /* number of compressed pages */
+	int compressed = 0;
+	int decompress = 0;
+
 	ENTRY;
+
+	/* Get chunk_desc if available - is this check necessary? */
+	if (req_capsule_has_field(&req->rq_pill,
+					&RMF_COMP_CHUNK_DESC, RCL_CLIENT)) {
+		/* TODO: this is NOT null even if client sent NULL!*/
+		ccdesc = req_capsule_client_get(tsi->tsi_pill,
+					&RMF_COMP_CHUNK_DESC);
+		/* Currently LZ4 only
+		 * TODO: algo per chunk can be different
+		 */
+		if (ccdesc) {
+			chunks = req_capsule_get_size(tsi->tsi_pill,
+					&RMF_COMP_CHUNK_DESC,
+					RCL_CLIENT) / sizeof(*ccdesc);
+			if (chunks == 0) {
+				/* Requst was not compressed */
+				/* TODO workaround or valid? */
+				ccdesc = NULL;
+			} else {
+				for (c = 0; c < chunks; c++) {
+					if (ccdesc[c].ccd_compressed != 0) {
+						/* TODO currently set chunks-wise, but decompression
+						 * performed request-wise when at least one chunk was
+						 * compressed
+						 */
+						compressed++;
+
+						/* Where to decompress?
+						 * Case L_CCLIENT: pass comped data to ZFS, comped when read,
+						 * comped over network when written/read, decomped on client
+						 * when read.
+						 * Case L_CSERVER: decomp on Lustre serv when written,
+						 * ZFS unaffected.
+						 * TODO: Will be decided dynamically, might be settable or
+						 * "hintable" per ladvise or similar
+						 */
+						if (ccdesc[c].ccd_decomp == L_CSERVER)
+							decompress++;
+					}
+				}
+			}
+
+		} else {
+			/* TODO
+			 * Handle unrecognized format
+			 */
+		}
+	} else {
+		/* TODO
+		 * Handle unrecognized format 
+		 */
+	}
 
 	if (ptlrpc_req2svc(req)->srv_req_portal != OST_IO_PORTAL &&
 	    ptlrpc_req2svc(req)->srv_req_portal != MDS_IO_PORTAL) {
@@ -2580,8 +2874,44 @@ int tgt_brw_write(struct tgt_session_info *tsi)
 	repbody->oa = body->oa;
 
 	npages = PTLRPC_MAX_BRW_PAGES;
+
+	if (compressed) {
+		/* Calculate number of compressed (or mixed) pages */
+		for (c = 0; c < chunks; c++) {
+			c_npages += (ccdesc[c].ccd_psize + ccdesc[c].ccd_header)
+						/ PAGE_SIZE;
+			if ((ccdesc[c].ccd_psize + ccdesc[c].ccd_header)
+						% PAGE_SIZE > 0)
+				c_npages++;
+		}
+
+		/* Helper array for physical page lengths in a ROW */
+		OBD_ALLOC(plens, c_npages * sizeof(int));
+		for (p = c = 0; c < chunks; c++) {
+			for (i = 0; i < ccdesc[c].ccd_ppages; i++) {
+				plens[p] = PAGE_SIZE;
+				if (unlikely(i == ccdesc[c].ccd_ppages-1
+					     && (ccdesc[c].ccd_psize +
+					     ccdesc[c].ccd_header) %
+					     PAGE_SIZE > 0))
+					plens[p] = (ccdesc[c].ccd_psize +
+						    ccdesc[c].ccd_header)
+						    % PAGE_SIZE;
+				p++;
+			}
+		}
+	}
+	/* For compression
+	 * case decompress = 1 (decompress on server)
+	 *        prepare logical sized buffers, npages -> uncompressed pages
+	 *        will put pysical size gapless
+	 *        will decomp and copy back logical sizes
+	 * case decompress = 0 (pass compressed data through to ZFS)
+	 *        prepare physical sized buffers, npages -> compressed pages
+	 */
 	rc = obd_preprw(tsi->tsi_env, OBD_BRW_WRITE, exp, &repbody->oa,
-			objcount, ioo, remote_nb, &npages, local_nb);
+			objcount, ioo, remote_nb, &npages, local_nb, ccdesc);
+
 	if (rc < 0)
 		GOTO(out_lock, rc);
 	if (body->oa.o_valid & OBD_MD_FLFLAGS &&
@@ -2598,25 +2928,54 @@ int tgt_brw_write(struct tgt_session_info *tsi)
 			       " size = %d\n", short_io_size);
 
 		/* Copy short io buf to pages */
+		/* TODO: fix short IO for compression */
 		rc = tgt_shortio2pages(local_nb, npages, short_io_buf,
 				       short_io_size);
 		desc = NULL;
 	} else {
-		desc = ptlrpc_prep_bulk_exp(req, npages, ioobj_max_brw_get(ioo),
-					    PTLRPC_BULK_GET_SINK |
-					    PTLRPC_BULK_BUF_KIOV,
-					    OST_BULK_PORTAL,
-					    &ptlrpc_bulk_kiov_nopin_ops);
+		if (compressed)
+			/* In both cases (decompress 1 or 0) prepare
+			 * c_npages for network transfer)
+			 */
+			desc = ptlrpc_prep_bulk_exp(req, c_npages,
+						ioobj_max_brw_get(ioo),
+						PTLRPC_BULK_GET_SINK |
+						PTLRPC_BULK_BUF_KIOV,
+						OST_BULK_PORTAL,
+						&ptlrpc_bulk_kiov_nopin_ops);
+		else
+			desc = ptlrpc_prep_bulk_exp(req, npages,
+						ioobj_max_brw_get(ioo),
+						PTLRPC_BULK_GET_SINK |
+						PTLRPC_BULK_BUF_KIOV,
+						OST_BULK_PORTAL,
+						&ptlrpc_bulk_kiov_nopin_ops);
 		if (desc == NULL)
 			GOTO(skip_transfer, rc = -ENOMEM);
 
 		/* NB Having prepped, we must commit... */
-		for (i = 0; i < npages; i++)
-			desc->bd_frag_ops->add_kiov_frag(desc,
-					local_nb[i].lnb_page,
-					local_nb[i].lnb_page_offset & ~PAGE_MASK,
-					local_nb[i].lnb_len);
 
+		if (compressed) {
+			/* In this step we assembly the bulk descriptor
+			 * for transfer. We will transfer the number of
+			 * compressed pages AND the compressed lengths.
+			 * In (!compressed) local_nb lengths are set to full
+			 * (logical) pages. In (compressed) they should
+			 * equal plens
+			 */
+			for (i = 0; i < c_npages; i++)
+				desc->bd_frag_ops->add_kiov_frag(desc,
+						local_nb[i].lnb_page,
+						local_nb[i].lnb_page_offset,
+						plens[i]);
+		} else {
+			for (i = 0; i < npages; i++)
+				desc->bd_frag_ops->add_kiov_frag(desc,
+						local_nb[i].lnb_page,
+						local_nb[i].lnb_page_offset
+							& ~PAGE_MASK,
+						local_nb[i].lnb_len);
+		}
 		rc = sptlrpc_svc_prep_bulk(req, desc);
 		if (rc != 0)
 			GOTO(skip_transfer, rc);
@@ -2638,9 +2997,15 @@ skip_transfer:
 		repbody->oa.o_flags |= obd_cksum_type_pack(obd_name,
 							   cksum_type);
 
-		rc = tgt_checksum_niobuf_rw(tsi->tsi_tgt, cksum_type,
-					    local_nb, npages, OST_WRITE,
-					    &repbody->oa.o_cksum);
+		if (compressed)
+			rc = tgt_checksum_niobuf_rw(tsi->tsi_tgt, cksum_type,
+						local_nb, c_npages, OST_WRITE,
+						&repbody->oa.o_cksum, plens);
+		else
+			rc = tgt_checksum_niobuf_rw(tsi->tsi_tgt, cksum_type,
+						local_nb, npages, OST_WRITE,
+						&repbody->oa.o_cksum, NULL);
+
 		if (rc < 0)
 			GOTO(out_commitrw, rc);
 
@@ -2650,9 +3015,14 @@ skip_transfer:
 			mmap = (body->oa.o_valid & OBD_MD_FLFLAGS &&
 				body->oa.o_flags & OBD_FL_MMAP);
 
-			tgt_warn_on_cksum(req, desc, local_nb, npages,
-					  body->oa.o_cksum,
-					  repbody->oa.o_cksum, mmap);
+			if (compressed)
+				tgt_warn_on_cksum(req, desc, local_nb, c_npages,
+						  body->oa.o_cksum,
+						  repbody->oa.o_cksum, mmap);
+			else
+				tgt_warn_on_cksum(req, desc, local_nb, npages,
+						  body->oa.o_cksum,
+						  repbody->oa.o_cksum, mmap);
 			cksum_counter = 0;
 		} else if ((cksum_counter & (-cksum_counter)) ==
 			   cksum_counter) {
@@ -2662,28 +3032,13 @@ skip_transfer:
 		}
 	}
 
-out_commitrw:
-	/* Must commit after prep above in all cases */
-	rc = obd_commitrw(tsi->tsi_env, OBD_BRW_WRITE, exp, &repbody->oa,
-			  objcount, ioo, remote_nb, npages, local_nb, rc);
-	if (rc == -ENOTCONN)
-		/* quota acquire process has been given up because
-		 * either the client has been evicted or the client
-		 * has timed out the request already */
-		no_reply = true;
-
-	for (i = 0; i < niocount; i++) {
-		if (!(local_nb[i].lnb_flags & OBD_BRW_ASYNC)) {
-			wait_sync = true;
-			break;
-		}
-	}
-	/*
-	 * Disable sending mtime back to the client. If the client locked the
-	 * whole object, then it has already updated the mtime on its side,
-	 * otherwise it will have to glimpse anyway (see bug 21489, comment 32)
+	/* Compression:
+	 * Mapping rnb to lnb = ppages to lpages;
+	 * lnbs contain original rnb-pages with original rnb-sizes and
+	 * rnb-offsets here, before decompression is performed and lnb-pages
+	 * are overwritten with decompressed data we have to check whether RCs
+	 * are !=0; later we can not
 	 */
-	repbody->oa.o_valid &= ~(OBD_MD_FLMTIME | OBD_MD_FLATIME);
 
 	if (rc == 0) {
 		int nob = 0;
@@ -2698,14 +3053,76 @@ out_commitrw:
 				LASSERT(j < npages);
 				if (local_nb[j].lnb_rc < 0)
 					rcs[i] = local_nb[j].lnb_rc;
-				len -= local_nb[j].lnb_len;
+				/* Here we count physical page lengths we got
+				 * in rnbs, not the decompressed lens from lnbs
+				 */
+				if (compressed)
+					len -= plens[j];
+				else
+					len -= local_nb[j].lnb_len;
 				j++;
 			} while (len > 0);
 			LASSERT(len == 0);
 		}
-		LASSERT(j == npages);
+		if (compressed)
+			LASSERT(j == c_npages);
+		else
+			LASSERT(j == npages);
+		/* TODO: Only compressed number of bytes is recognized here.
+		 * Where to put lnb-nob to?
+		 */
 		ptlrpc_lprocfs_brw(req, nob);
 	}
+
+	if (compressed && decompress) {
+		/* Decompression, compressed = 0 on success */
+		p = decompress_data(OBD_BRW_WRITE, c_npages, local_nb,
+					chunks, ccdesc, plens);
+		if (decompress - p != 0) {
+			CERROR("Decompression of %d chunks failed!\n",
+					decompress - p);
+			/* TODO: should not happen - HANDLE */
+		} else {
+			compressed = 0;
+		}
+	}
+
+out_commitrw:
+	/* Must commit after prep above in all cases */
+	if (!compressed) {
+		/* We had or have now logical pages as like they
+		 * have never been compressed
+		 */
+		rc = obd_commitrw(tsi->tsi_env, OBD_BRW_WRITE, exp,
+				&repbody->oa, objcount, ioo, remote_nb,
+				npages, local_nb, compressed, rc);
+	} else {
+		/* Compressed stuff goes to ZFS */
+		rc = obd_commitrw(tsi->tsi_env, OBD_BRW_WRITE, exp,
+				&repbody->oa, objcount, ioo, remote_nb,
+				c_npages, local_nb, compressed, rc);
+	}
+	if (rc == -ENOTCONN)
+		/* quota acquire process has been given up because
+		 * either the client has been evicted or the client
+		 * has timed out the request already
+		 */
+		no_reply = true;
+
+
+	for (i = 0; i < niocount; i++) {
+		if (!(local_nb[i].lnb_flags & OBD_BRW_ASYNC)) {
+			wait_sync = true;
+			break;
+		}
+	}
+	/*
+	 * Disable sending mtime back to the client. If the client locked the
+	 * whole object, then it has already updated the mtime on its side,
+	 * otherwise it will have to glimpse anyway (see bug 21489, comment 32)
+	 */
+	repbody->oa.o_valid &= ~(OBD_MD_FLMTIME | OBD_MD_FLATIME);
+
 out_lock:
 	tgt_brw_unlock(ioo, remote_nb, &lockh, LCK_PW);
 	if (desc)
@@ -2722,6 +3139,9 @@ out:
 				      obd_uuid2str(&exp->exp_client_uuid),
 				      obd_export_nid2str(exp), rc);
 	}
+	if (plens)
+		OBD_FREE(plens, c_npages * sizeof(*plens));
+
 	memory_pressure_clr();
 	RETURN(rc);
 }

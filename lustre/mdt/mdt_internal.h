@@ -1320,12 +1320,12 @@ static inline char *mdt_req_get_jobid(struct ptlrpc_request *req)
 int mdt_obd_preprw(const struct lu_env *env, int cmd, struct obd_export *exp,
 		   struct obdo *oa, int objcount, struct obd_ioobj *obj,
 		   struct niobuf_remote *rnb, int *nr_local,
-		   struct niobuf_local *lnb);
+		   struct niobuf_local *lnb, struct comp_chunk_desc *ccdesc);
 
 int mdt_obd_commitrw(const struct lu_env *env, int cmd, struct obd_export *exp,
 		     struct obdo *oa, int objcount, struct obd_ioobj *obj,
 		     struct niobuf_remote *rnb, int npages,
-		     struct niobuf_local *lnb, int old_rc);
+		     struct niobuf_local *lnb, int comp, int old_rc);
 int mdt_punch_hdl(struct tgt_session_info *tsi);
 int mdt_glimpse_enqueue(struct mdt_thread_info *mti, struct ldlm_namespace *ns,
 			struct ldlm_lock **lockp, __u64 flags);

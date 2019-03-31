@@ -2674,7 +2674,8 @@ static int echo_client_prep_commit(const struct lu_env *env,
 		off += npages * PAGE_SIZE;
 
 		lpages = npages;
-		ret = obd_preprw(env, rw, exp, oa, 1, &ioo, &rnb, &lpages, lnb);
+		ret = obd_preprw(env, rw, exp, oa, 1, &ioo, &rnb, &lpages, lnb,
+				 NULL);
 		if (ret != 0)
 			GOTO(out, ret);
 
@@ -2706,7 +2707,7 @@ static int echo_client_prep_commit(const struct lu_env *env,
 		}
 
 		ret = obd_commitrw(env, rw, exp, oa, 1, &ioo, &rnb, npages, lnb,
-				   ret);
+				   0, ret);
 		if (ret != 0)
 			break;
 

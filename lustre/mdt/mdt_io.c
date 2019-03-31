@@ -421,7 +421,7 @@ static int mdt_preprw_read(const struct lu_env *env, struct obd_export *exp,
 	dob = mdt_obj2dt(mo);
 	/* parse remote buffers to local buffers and prepare the latter */
 	for (i = 0, j = 0; i < niocount; i++) {
-		rc = dt_bufs_get(env, dob, rnb + i, lnb + j, maxlnb, 0);
+		rc = dt_bufs_get(env, dob, rnb + i, lnb + j, maxlnb, NULL, 0);
 		if (unlikely(rc < 0))
 			GOTO(buf_put, rc);
 		/* correct index for local buffers to continue with */
@@ -494,7 +494,7 @@ static int mdt_preprw_write(const struct lu_env *env, struct obd_export *exp,
 	dob = mdt_obj2dt(mo);
 	/* parse remote buffers to local buffers and prepare the latter */
 	for (i = 0, j = 0; i < obj->ioo_bufcnt; i++) {
-		rc = dt_bufs_get(env, dob, rnb + i, lnb + j, maxlnb, 1);
+		rc = dt_bufs_get(env, dob, rnb + i, lnb + j, maxlnb, NULL, 1);
 		if (unlikely(rc < 0))
 			GOTO(err, rc);
 		/* correct index for local buffers to continue with */
@@ -531,7 +531,7 @@ unlock:
 int mdt_obd_preprw(const struct lu_env *env, int cmd, struct obd_export *exp,
 		   struct obdo *oa, int objcount, struct obd_ioobj *obj,
 		   struct niobuf_remote *rnb, int *nr_local,
-		   struct niobuf_local *lnb)
+		   struct niobuf_local *lnb, struct comp_chunk_desc *ccdesc)
 {
 	struct tgt_session_info *tsi = tgt_ses_info(env);
 	struct mdt_thread_info *info = tsi2mdt_info(tsi);
@@ -673,7 +673,7 @@ retry:
 		GOTO(out_stop, rc);
 
 	dt_write_lock(env, dob, 0);
-	rc = dt_write_commit(env, dob, lnb, niocount, th);
+	rc = dt_write_commit(env, dob, lnb, niocount, th, 0);
 	if (rc)
 		GOTO(unlock, rc);
 
@@ -737,7 +737,7 @@ void mdt_dom_obj_lvb_update(const struct lu_env *env, struct mdt_object *mo,
 int mdt_obd_commitrw(const struct lu_env *env, int cmd, struct obd_export *exp,
 		     struct obdo *oa, int objcount, struct obd_ioobj *obj,
 		     struct niobuf_remote *rnb, int npages,
-		     struct niobuf_local *lnb, int old_rc)
+		     struct niobuf_local *lnb, int comp, int old_rc)
 {
 	struct mdt_thread_info *info = mdt_th_info(env);
 	struct mdt_device *mdt = mdt_dev(exp->exp_obd->obd_lu_dev);
@@ -1548,7 +1548,8 @@ int mdt_dom_read_on_open(struct mdt_thread_info *mti, struct mdt_device *mdt,
 	if (lnb == NULL)
 		GOTO(unlock, rc = -ENOMEM);
 
-	rc = dt_bufs_get(env, mo, rnb, lnb, lnbs, 0);
+	rc = dt_bufs_get(env, mo, rnb, lnb, lnbs, NULL, 0);
+
 	if (unlikely(rc < 0))
 		GOTO(free, rc);
 	LASSERT(rc <= lnbs);
