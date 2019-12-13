@@ -1544,6 +1544,13 @@ int compress_cbuf(struct brw_page **pga, struct brw_page ***cpga,
 	buf_offset = pga[0]->off;
 
 	for (c = 0; c < chunks; c++) {
+		if (OBD_FAIL_CHECK(OBD_FAIL_OSC_CMP_INCOMPRESSIBLE)) {
+			if (c % 2 == 0) {
+				comprsd = 0;
+				page = ccdesc[c].ccd_lpages;
+				goto uncompressed;
+			}
+		}
 		ccdesc[c].ccd_chunksize = chunksize;
 		if (ccdesc[c].ccd_lsize < ccdesc[c].ccd_chunksize) {
 			/* TODO: Own debug level, D_COMP or D_TRANS for

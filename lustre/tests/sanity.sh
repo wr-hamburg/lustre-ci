@@ -22646,6 +22646,55 @@ test_819b() {
 run_test 819b "too big niobuf in write"
 
 #
+# Compression specific tests
+#
+
+test_814() {
+	local file="/tmp/$tfile"
+	
+	dd if=/dev/urandom of=$file bs=10M count=1 || error "dd failed"
+	lctl set_param fail_loc=0x80000415
+	cp $file $DIR/$tfile
+	sync || error "sync failed"
+	sync_all_data
+	cmp $file $DIR/$tfile || error "cmp failed"
+	lctl set_param fail_loc=0
+	rm -f $file
+	rm -f $DIR/$tfile
+}
+run_test 814 "Write data and have an incompressible chunk every two chunks"
+
+test_815() {
+	local file="/tmp/$tfile"
+	i=0; while true; do echo -n "$i"a; ((i=(i+1)%5)); done | dd of=$file bs=4M count=1 conv=notrunc iflag=fullblock || error "dd failed"
+	cp $file $DIR/$tfile
+	sync || error "sync failed"
+	sync_all_data
+	cmp $file $DIR/$tfile || error "cmp failed"
+	rm -f $file
+	rm -f $DIR/$tfile
+}
+run_test 815 "Compressed block < page_size case"
+
+test_816() {
+	local change_after=5000
+	i=0; while true; do echo -n "$i"; ((i=(i+1))); if [ "$i" -eq "$change_after" ]; then $LCTL set_param osc.*.compression=0; fi; done | dd of=$DIR/$tfile bs=1M count=1 conv=notrunc iflag=fullblock oflag=direct || error "dd failed"
+	sync || error "sync failed"
+	sync_all_data
+	$LCTL set_param osc.*.compression=1
+	rm -f $DIR/$tfile
+}
+run_test 816 "Stop compression feature within write process"
+
+test_817() {
+	i=0; while true; do echo -n "$i"; ((i=(i+1))); done | dd of=$DIR/$tfile bs=1 count=4648  || error "dd failed"
+	sync || error "sync failed"
+	sync_all_data
+	rm -f $DIR/$tfile
+}
+run_test 817 "Test file which is exactly 4096 bytes big after lz4 compression (including 4 bytes LZ4 header)"
+
+#
 # tests that do cleanup/setup should be run at the end
 #
 
