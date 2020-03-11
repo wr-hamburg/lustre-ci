@@ -444,12 +444,8 @@ static inline arc_buf_t *osd_request_compressed_arcbuf(dnode_t *dn, int psize,
 {
 	arc_buf_t *abuf;
 
-	/*
 	abuf = dmu_request_compressed_arcbuf(&dn->dn_bonus->db, psize, lsize,
 				compression_type);
-	 */
-	CERROR("This code path requires patched ZFS servion, skipped here\n");
-	abuf = NULL;
 
 	if (unlikely(!abuf))
 		return ERR_PTR(-ENOMEM);

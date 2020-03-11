@@ -1663,7 +1663,7 @@ uncompressed:
 			ccdesc[c].ccd_psize = comprsd;
 			ccdesc[c].ccd_ppages = comp_pages;
 			ccdesc[c].ccd_poffset = ppages * PAGE_SIZE;
-			ccdesc[c].ccd_decomp = L_CSERVER;
+			ccdesc[c].ccd_decomp = L_CCLIENT;
 
 			ppages += comp_pages;
 
