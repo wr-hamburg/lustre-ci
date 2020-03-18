@@ -1,0 +1,29 @@
+--- lustre/tests/test-framework.sh	2019-10-06 17:33:49.114766351 +0200
++++ lustre/tests/test-framework_notouch.sh	2019-10-08 18:14:28.778186388 +0200
+@@ -4426,7 +4426,7 @@
+ 	# touch "device" in case it is a loopback file for testing and needs to
+ 	# be created. mkfs.lustre doesn't do this to avoid accidentally writing
+ 	# to non-existent files in /dev if the admin made a typo during setup
+-	__touch_device mgs
++	#__touch_device mgs
+ 
+ 	add mgs $(mkfs_opts mgs $(mgsdevname)) $(mountfs_opts mgs) --reformat \
+ 		$(mgsdevname) $(mgsvdevname) ${quiet:+>/dev/null} || exit 10
+@@ -4442,7 +4442,7 @@
+ 	echo "Format mds$num: $(mdsdevname $num)"
+ 	reformat_external_journal mds$num
+ 
+-	__touch_device mds $num
++	#__touch_device mds $num
+ 
+ 	add mds$num $(mkfs_opts mds$num $(mdsdevname ${num})) \
+ 		$(mountfs_opts mds$num) --reformat $(mdsdevname $num) \
+@@ -4458,7 +4458,7 @@
+ 	echo "Format ost$num: $(ostdevname $num)"
+ 	reformat_external_journal ost$num
+ 
+-	__touch_device ost $num
++	#__touch_device ost $num
+ 
+ 	add ost$num $(mkfs_opts ost$num $(ostdevname ${num})) \
+ 		$(mountfs_opts ost$num) --reformat $(ostdevname $num) \

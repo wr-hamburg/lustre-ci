@@ -1,0 +1,64 @@
+name: Build & Test
+
+on: [push]
+
+jobs:
+  buildtest:
+    runs-on: ubuntu-16.04 #ubuntu-latest
+    steps:
+    - uses: actions/checkout@v1
+    - name: Install dependencies
+      run: |
+        sudo rm -rf /lib/modules/*/kernel/zfs/
+        sudo rm -rf /lib/modules/*/kernel/spl/
+        depmod -a
+        sudo apt-get update
+        #sudo apt-get upgrade
+        # Lustre
+        sudo apt-get install ed module-assistant build-essential libreadline-dev debhelper dpatch automake libsnmp-dev bzip2 quilt linux-headers-generic rsync libtool python-docutils libyaml-dev libselinux-dev pkg-config mpi-default-dev
+        # ZFS
+        sudo apt-get install build-essential autoconf automake libtool gawk alien fakeroot dkms libblkid-dev uuid-dev libudev-dev libssl-dev zlib1g-dev libaio-dev libattr1-dev libelf-dev linux-headers-$(uname -r) python3 python3-dev python3-setuptools python3-cffi libffi-dev
+        # reboot
+    - name: Build ZFS
+      run: |
+        git clone --branch externally-compressed-data --depth 1 https://github.com/hauke96/zfs.git
+        #git clone https://github.com/zfsonlinux/zfs.git
+        cd zfs
+        ./autogen.sh
+        ./configure
+        make pkg-utils deb-kmod
+        ls -lah *.deb
+        sudo dpkg -i *.deb
+    - name: Build Lustre
+      env:
+          GITKEY_WR: ${{ secrets.GIT_WR }}
+      run: |
+        #git clone --branch b2_12 --depth 1 git://git.whamcloud.com/fs/lustre-release.git
+        git clone --branch ipcc/tests https://julius.plehn:$GITKEY_WR@git.wr.informatik.uni-hamburg.de/ipcc/lustre.git lustre-release
+        cd lustre-release
+        git diff 50751e50e8..HEAD > tests.patch
+        git checkout ipcc/github
+        sed -i '22654d' lustre/tests/sanity.sh
+        sed -i 's/cmp_pool_init(100, 128 \* 1024);/cmp_pool_init(32*8*8, 128 * 1024);/' lustre/osc/osc_request.c
+        patch -p1 < tests.patch
+        sudo patch -p1 < $GITHUB_WORKSPACE/selinux.patch
+        sh autogen.sh
+        ./configure --disable-ldiskfs
+        make debs -j $(nproc)
+        find . -name '*.deb' 
+        sudo apt install $(find . -name '*.deb' | tr '\n' ' ')
+    - name: Run Lustre Tests
+      run: |
+        sudo depmod -a
+        sudo modprobe zfs -v
+        sudo groupadd -g 500 tests && sudo useradd -u 500 -g 500 runas
+        cd /usr/lib/lustre/ && sudo patch -p1 < $GITHUB_WORKSPACE/test_framework.patch
+        cd /usr/lib/lustre/tests
+        sudo sed -i '1s/^/FSTYPE=zfs\n/' cfg/local.sh 
+        sudo VERBOSE=true ./llmount.sh
+        sudo ./auster -v -r sanity.sh --only 0a,830,834,835
+    - uses: actions/upload-artifact@v1
+      with:
+        name: test-logs
+        path: /tmp/test_logs/
+
