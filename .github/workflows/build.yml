@@ -31,10 +31,10 @@ jobs:
         sudo dpkg -i *.deb
     - name: Build Lustre
       env:
-          GITKEY_WR: ${{ secrets.GIT_WR }}
+          GIT_WR: ${{ secrets.GIT_WR }}
       run: |
         #git clone --branch b2_12 --depth 1 git://git.whamcloud.com/fs/lustre-release.git
-        git clone --branch ipcc/tests https://wr-bot:$GITKEY_WR@git.wr.informatik.uni-hamburg.de/ipcc/lustre.git lustre-release
+        git clone --branch ipcc/tests https://$GIT_WR@git.wr.informatik.uni-hamburg.de/ipcc/lustre.git lustre-release
         cd lustre-release
         git diff 50751e50e8..HEAD > tests.patch
         git checkout ipcc/github
