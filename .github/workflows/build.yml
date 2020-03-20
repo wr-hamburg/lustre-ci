@@ -57,7 +57,9 @@ jobs:
         sudo sed -i '1s/^/FSTYPE=zfs\n/' cfg/local.sh
         sudo VERBOSE=true ./llmount.sh
         sudo ./auster -v -r sanity.sh --only 0a,830,834,835
+        if find /tmp/test_logs/ -name "err" | grep -q "."; then exit 1; fi
     - uses: actions/upload-artifact@v1
+      if: failure()
       with:
         name: test-logs
         path: /tmp/test_logs/
